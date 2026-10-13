@@ -581,21 +581,21 @@ mod adapter {
         Err(CarryError::Internal(anyhow!("not implemented: {cmd}")))
     }
 
-    pub async fn init(_s: &Settings) -> Result<Value> { todo_dispatch("init") }
-    pub async fn doctor(_s: &Settings) -> Result<Value> { todo_dispatch("doctor") }
-    pub async fn put(_s: &Settings, _state: &str, _path: &str, _bytes: Vec<u8>, _mode: u32) -> Result<Value> { todo_dispatch("put") }
-    pub async fn get(_s: &Settings, _state: &str, _path: &str) -> Result<GetOutput> { todo_dispatch("get") }
-    pub async fn ls(_s: &Settings, _state: &str, _dir: Option<&str>) -> Result<Value> { todo_dispatch("ls") }
-    pub async fn rm(_s: &Settings, _state: &str, _path: &str) -> Result<Value> { todo_dispatch("rm") }
-    pub async fn mv(_s: &Settings, _state: &str, _from: &str, _to: &str) -> Result<Value> { todo_dispatch("mv") }
-    pub async fn log(_s: &Settings, _state: &str, _limit: Option<usize>) -> Result<Value> { todo_dispatch("log") }
-    pub async fn diff(_s: &Settings, _state: &str, _v1: u64, _v2: u64) -> Result<Value> { todo_dispatch("diff") }
-    pub async fn rollback(_s: &Settings, _state: &str, _version: u64) -> Result<Value> { todo_dispatch("rollback") }
-    pub async fn env_set(_s: &Settings, _state: &str, _kv: Vec<(String, String)>) -> Result<Value> { todo_dispatch("env set") }
-    pub async fn env_unset(_s: &Settings, _state: &str, _keys: Vec<String>) -> Result<Value> { todo_dispatch("env unset") }
-    pub async fn env_import(_s: &Settings, _state: &str, _text: &str) -> Result<Value> { todo_dispatch("env import") }
-    pub async fn env_get(_s: &Settings, _state: &str, _key: Option<&str>) -> Result<Value> { todo_dispatch("env get") }
-    pub async fn states(_s: &Settings) -> Result<Value> { todo_dispatch("states") }
+    pub async fn init(s: &Settings) -> Result<Value> { crate::ops::init(s).await }
+    pub async fn doctor(s: &Settings) -> Result<Value> { crate::ops::doctor(s).await }
+    pub async fn put(s: &Settings, state: &str, path: &str, bytes: Vec<u8>, mode: u32) -> Result<Value> { crate::ops::put(s, state, path, bytes, mode).await }
+    pub async fn get(s: &Settings, state: &str, path: &str) -> Result<GetOutput> { crate::ops::get(s, state, path).await }
+    pub async fn ls(s: &Settings, state: &str, dir: Option<&str>) -> Result<Value> { crate::ops::ls(s, state, dir).await }
+    pub async fn rm(s: &Settings, state: &str, path: &str) -> Result<Value> { crate::ops::rm(s, state, path).await }
+    pub async fn mv(s: &Settings, state: &str, from: &str, to: &str) -> Result<Value> { crate::ops::mv(s, state, from, to).await }
+    pub async fn log(s: &Settings, state: &str, limit: Option<usize>) -> Result<Value> { crate::ops::log(s, state, limit).await }
+    pub async fn diff(s: &Settings, state: &str, v1: u64, v2: u64) -> Result<Value> { crate::ops::diff(s, state, v1, v2).await }
+    pub async fn rollback(s: &Settings, state: &str, version: u64) -> Result<Value> { crate::ops::rollback(s, state, version).await }
+    pub async fn env_set(s: &Settings, state: &str, kv: Vec<(String, String)>) -> Result<Value> { crate::ops::env_set(s, state, kv).await }
+    pub async fn env_unset(s: &Settings, state: &str, keys: Vec<String>) -> Result<Value> { crate::ops::env_unset(s, state, keys).await }
+    pub async fn env_import(s: &Settings, state: &str, text: &str) -> Result<Value> { crate::ops::env_import(s, state, text).await }
+    pub async fn env_get(s: &Settings, state: &str, key: Option<&str>) -> Result<Value> { crate::ops::env_get(s, state, key).await }
+    pub async fn states(s: &Settings) -> Result<Value> { crate::ops::states(s).await }
     pub async fn status(_s: &Settings) -> Result<Value> { todo_dispatch("status") }
     pub async fn run(_s: &Settings, _cmd: Vec<String>) -> i32 {
         eprintln!("carry: not implemented: run");
