@@ -77,6 +77,8 @@ impl MasterKey {
 pub struct DataKey {
     key: [u8; 32],
     id_key: [u8; 32],
+    /// Distinct id key for manifests (domain separation from blobs).
+    manifest_id_key: [u8; 32],
 }
 
 impl std::fmt::Debug for DataKey {
@@ -104,7 +106,9 @@ impl DataKey {
         let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, &key);
         let mut id_key = [0u8; 32];
         hk.expand(b"carry blob id", &mut id_key).expect("32 bytes is a valid hkdf length");
-        DataKey { key, id_key }
+        let mut manifest_id_key = [0u8; 32];
+        hk.expand(b"carry manifest id", &mut manifest_id_key).expect("32 bytes is a valid hkdf length");
+        DataKey { key, id_key, manifest_id_key }
     }
     pub fn wrap(&self, mk: &MasterKey) -> WrappedKey {
         let sealed = seal_raw(&mk.cipher(), &self.key, b"carry data key v1");
@@ -189,6 +193,59 @@ impl Cipher {
             Cipher::Encrypted(k) => blob_id(k, pt),
             Cipher::None => blake3::hash(pt).to_hex().to_string(),
         }
+    }
+}
+
+// ---- manifests (domain-separated from blobs) ----
+
+/// First byte of a v2 manifest object: id and AEAD bound to the "manifest" label and the state.
+pub const FMT_MANIFEST_V2: u8 = 3;
+/// First byte of a single-shot blob whose AEAD carries the "blob" label.
+pub const FMT_SINGLE_V2: u8 = 4;
+const BLOB_AAD_V2: &[u8] = b"carry blob v2";
+
+fn manifest_aad(state: &str) -> Vec<u8> {
+    let mut a = b"carry manifest v2\0".to_vec();
+    a.extend_from_slice(state.as_bytes());
+    a
+}
+
+impl Cipher {
+    /// Keyed id for a manifest (label "carry manifest id"), distinct from any blob id.
+    pub fn manifest_id(&self, json: &[u8]) -> String {
+        match self {
+            Cipher::Encrypted(k) => blake3::keyed_hash(&k.manifest_id_key, json).to_hex().to_string(),
+            Cipher::None => {
+                let mut h = blake3::Hasher::new_derive_key("carry manifest id v2");
+                h.update(json);
+                h.finalize().to_hex().to_string()
+            }
+        }
+    }
+    /// FMT_MANIFEST_V2 || seal(zstd(json), aad = "carry manifest v2" + state).
+    pub fn seal_manifest(&self, json: &[u8], state: &str) -> Result<Vec<u8>> {
+        let z = compress(json)?;
+        let mut out = vec![FMT_MANIFEST_V2];
+        match self {
+            Cipher::Encrypted(k) => out.extend_from_slice(&seal_raw(&k.cipher(), &z, &manifest_aad(state))),
+            Cipher::None => out.extend_from_slice(&z),
+        }
+        Ok(out)
+    }
+    /// Open a manifest object. Returns (json, is_v2). v2 objects must match `state`;
+    /// legacy (pre-v2, unmarked) objects are still accepted with the legacy blob-domain id.
+    pub fn open_manifest(&self, data: &[u8], state: &str) -> Result<(Vec<u8>, bool)> {
+        if data.first() == Some(&FMT_MANIFEST_V2) {
+            let r = match self {
+                Cipher::Encrypted(k) => open_raw(&k.cipher(), &data[1..], &manifest_aad(state)).and_then(|z| decompress(&z)),
+                Cipher::None => decompress(&data[1..]),
+            };
+            if let Ok(j) = r {
+                return Ok((j, true));
+            }
+        }
+        // A legacy encrypted object starts with a random nonce byte, which may equal the marker.
+        Ok((self.open_decompress(data)?, false))
     }
 }
 
@@ -361,8 +418,12 @@ impl Cipher {
     /// Whole blob object for an in-memory plaintext (single-shot or chunked by size).
     pub fn encode_blob(&self, pt: &[u8]) -> Result<Vec<u8>> {
         if pt.len() as u64 <= CHUNK_THRESHOLD {
-            let mut out = vec![FMT_SINGLE];
-            out.extend_from_slice(&self.compress_seal(pt)?);
+            let z = compress(pt)?;
+            let mut out = vec![FMT_SINGLE_V2];
+            match self {
+                Cipher::Encrypted(k) => out.extend_from_slice(&seal_raw(&k.cipher(), &z, BLOB_AAD_V2)),
+                Cipher::None => out.extend_from_slice(&z),
+            }
             return Ok(out);
         }
         let (mut out, mut enc) = self.chunk_encoder();
@@ -374,6 +435,15 @@ impl Cipher {
     }
     /// Decode a single-shot object (with FMT_SINGLE header, or a legacy headerless one).
     pub fn decode_single(&self, data: &[u8]) -> Result<Vec<u8>> {
+        if data.first() == Some(&FMT_SINGLE_V2) {
+            let r = match self {
+                Cipher::Encrypted(k) => open_raw(&k.cipher(), &data[1..], BLOB_AAD_V2).and_then(|z| decompress(&z)),
+                Cipher::None => decompress(&data[1..]),
+            };
+            if let Ok(v) = r {
+                return Ok(v);
+            }
+        }
         if data.first() == Some(&FMT_SINGLE) {
             if let Ok(v) = self.open_decompress(&data[1..]) {
                 return Ok(v);
@@ -462,6 +532,28 @@ mod tests {
         let c = Cipher::None;
         assert_eq!(c.seal(b"abc"), b"abc");
         assert_eq!(c.blob_id(b"abc"), blake3::hash(b"abc").to_hex().to_string());
+    }
+
+    #[test]
+    fn manifest_and_blob_domains_are_separate() {
+        let c = Cipher::Encrypted(DataKey::generate());
+        let json = br#"{"a":1}"#;
+        assert_ne!(c.manifest_id(json), c.blob_id(json));
+        let m = c.seal_manifest(json, "web-1").unwrap();
+        assert_eq!(c.open_manifest(&m, "web-1").unwrap(), (json.to_vec(), true));
+        // Bound to the state and to the manifest label.
+        assert!(c.open_manifest(&m, "web-2").is_err());
+        assert!(c.decode_single(&m).is_err());
+        let b = c.encode_blob(json).unwrap();
+        assert_eq!(b[0], FMT_SINGLE_V2);
+        assert_eq!(c.decode_single(&b).unwrap(), json);
+        assert!(c.open_manifest(&b, "web-1").is_err());
+        // Legacy objects still open.
+        let legacy = c.compress_seal(json).unwrap();
+        assert_eq!(c.open_manifest(&legacy, "web-1").unwrap(), (json.to_vec(), false));
+        let mut lb = vec![FMT_SINGLE];
+        lb.extend_from_slice(&legacy);
+        assert_eq!(c.decode_single(&lb).unwrap(), json);
     }
 
     #[test]

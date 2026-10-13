@@ -105,18 +105,72 @@ pub fn current_manifest(root: &Path) -> Option<Manifest> {
 
 /// Returns the seq now in `current` (None when the state has no versions: empty generation).
 async fn sync_generation(repo: &Repo, state: &str, root: &Path) -> Result<Option<u64>> {
+    let mark = read_hwm(root).get(state).copied().unwrap_or(0);
     let m = match ctx::current(repo, state).await? {
         Some((_, _, m)) => m,
+        None if mark > 0 => {
+            return Err(CarryError::Invalid(format!("HEAD of '{state}' vanished after version {mark} was seen")));
+        }
         None => {
             ensure_empty_generation(root).map_err(io)?;
             return Ok(None);
         }
     };
+    if m.seq < mark {
+        return Err(CarryError::Invalid(format!(
+            "HEAD of '{state}' went back to version {} after version {mark} was seen; keeping current generation",
+            m.seq
+        )));
+    }
     if current_generation(root) == Some(m.seq) && root.join("current/manifest.json").exists() {
         return Ok(Some(m.seq));
     }
     write_generation(repo, &m, root).await?;
+    if let Err(e) = write_hwm(root, state, m.seq) {
+        eprintln!("carry: warning: cannot record high-water mark: {e}");
+    }
     Ok(Some(m.seq))
+}
+
+const HWM_FILE: &str = "state-hwm.json";
+
+/// Highest HEAD seq ever restored per state (rollback / replay protection).
+fn read_hwm(root: &Path) -> std::collections::BTreeMap<String, u64> {
+    std::fs::read(root.join(HWM_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn write_hwm(root: &Path, state: &str, seq: u64) -> std::io::Result<()> {
+    let mut h = read_hwm(root);
+    let cur = h.entry(state.to_string()).or_insert(0);
+    if seq <= *cur {
+        return Ok(());
+    }
+    *cur = seq;
+    let tmp = root.join(".state-hwm.json.tmp");
+    write_file(&tmp, &serde_json::to_vec(&h).map_err(std::io::Error::other)?, 0o600)?;
+    std::fs::rename(tmp, root.join(HWM_FILE))
+}
+
+/// Entries that conflict with another entry (ancestor/descendant). Such a manifest predates
+/// the write-time check; these entries are skipped rather than failing the whole restore.
+fn conflicting(m: &Manifest) -> std::collections::BTreeSet<String> {
+    m.entries.keys().filter(|p| ctx::path_conflict(&m.entries, p).is_some()).cloned().collect()
+}
+
+/// Create `rel`'s directories under `base`, refusing to traverse anything that is not a
+/// real directory (a symlink planted in the tree can never redirect a write outside it).
+fn mkdirs_inside(base: &Path, rel: &Path) -> std::io::Result<()> {
+    let mut cur = base.to_path_buf();
+    for c in rel.components() {
+        cur.push(c);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(md) if md.file_type().is_dir() => {}
+            Ok(_) => return Err(std::io::Error::other(format!("{} is not a real directory", cur.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&cur)?,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 async fn write_generation(repo: &Repo, m: &Manifest, root: &Path) -> Result<()> {
@@ -128,12 +182,20 @@ async fn write_generation(repo: &Repo, m: &Manifest, root: &Path) -> Result<()> 
     let files = tmp.join("files");
     std::fs::create_dir_all(&files).map_err(io)?;
 
+    let skip = conflicting(m);
+    for p in &skip {
+        eprintln!("carry: warning: skipping {p}: conflicts with another entry (file and directory at once)");
+    }
     let mut jobs = Vec::new();
-    for (path, e) in &m.entries {
-        let dest = files.join(rel(path)?);
-        if let Some(p) = dest.parent() {
-            std::fs::create_dir_all(p).map_err(io)?;
+    for (path, e) in m.entries.iter().filter(|(p, _)| !skip.contains(*p)) {
+        let r = rel(path)?;
+        if let Some(p) = r.parent() {
+            if let Err(err) = mkdirs_inside(&files, p) {
+                eprintln!("carry: warning: skipping {path}: {err}");
+                continue;
+            }
         }
+        let dest = files.join(r);
         match e.kind {
             EntryKind::Symlink => {
                 let t = e.target.as_deref().ok_or_else(|| CarryError::Invalid(format!("{path}: symlink without target")))?;
@@ -195,7 +257,14 @@ async fn write_entry(repo: &Repo, path: &str, e: &Entry, dest: &Path) -> Result<
 }
 
 fn open_dest(dest: &Path, mode: u32) -> std::io::Result<std::fs::File> {
-    let f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(dest)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW: never write through a symlink sitting at the destination.
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(dest)?;
     f.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))?;
     Ok(f)
 }
@@ -313,8 +382,9 @@ pub fn materialise(root: &Path, m: &Manifest) -> usize {
             let _ = std::fs::rename(&tmp, &record);
         }
     }
+    let skip = conflicting(m);
     let mut n = 0;
-    for path in m.entries.keys() {
+    for path in m.entries.keys().filter(|p| !skip.contains(*p)) {
         match materialise_one(root, path) {
             Ok(()) => n += 1,
             Err(e) => eprintln!("carry: warning: cannot materialise {path}: {e}"),
@@ -374,11 +444,21 @@ pub async fn status(s: &Settings) -> Result<Value> {
             json!({"state": state_name(s), "mode": "degraded", "version": null,
                 "last_restore_ms": null, "error": "no restore has run yet"})
         });
+    // Written by tool prefetch: name -> {"status": "ready"|"failed", "reason"}.
+    let prefetch: serde_json::Map<String, Value> = std::fs::read(s.root.join("cache/tools/status.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
     let tools: Vec<Value> = current_manifest(&s.root)
         .map(|m| {
             m.apps
                 .keys()
                 .map(|name| {
+                    let p = prefetch.get(name);
+                    if p.and_then(|v| v.get("status")).and_then(Value::as_str) == Some("failed") {
+                        let reason = p.and_then(|v| v.get("reason")).cloned().unwrap_or(Value::Null);
+                        return json!({"name": name, "status": "failed", "reason": reason});
+                    }
                     let ready = s.root.join("cache/tools").join(name).exists();
                     json!({"name": name, "status": if ready { "ready" } else { "missing" }})
                 })
@@ -608,6 +688,103 @@ pub(crate) mod tests {
             mib(base), mib(after_put), mib(after_put - base), mib(after_restore), mib(after_restore - base)
         );
         assert!(after_restore - base < 64 << 20, "peak RSS grew {:.1} MiB", mib(after_restore - base));
+    }
+
+    fn inline(b: &[u8]) -> Entry {
+        Entry {
+            kind: EntryKind::File,
+            mode: 0o644,
+            size: b.len() as u64,
+            blob: None,
+            inline: Some(base64::engine::general_purpose::STANDARD.encode(b)),
+            target: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_bad_manifest_skips_conflicts_and_never_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let repo = mem_repo().await;
+        // Written directly (bypassing the write-time check), as an older carry could have.
+        let mut m = crate::repo::tests::manifest(1, None);
+        m.entries.insert("/a".into(), inline(b"file"));
+        m.entries.insert("/a/b".into(), inline(b"child"));
+        m.entries.insert(
+            "/x".into(),
+            Entry { kind: EntryKind::Symlink, mode: 0o777, size: 0, blob: None, inline: None, target: Some(outside.display().to_string()) },
+        );
+        m.entries.insert("/x/passwd".into(), inline(b"pwned"));
+        m.entries.insert("/ok".into(), inline(b"fine"));
+        repo.commit("w", None, &m).await.unwrap();
+        let r = restore_with(async { Ok(repo.clone()) }, "w", &root, budget()).await;
+        assert_eq!((r.mode.clone(), r.version), (Mode::Ok, Some(1)), "{:?}", r.error);
+        assert_eq!(std::fs::read(root.join("current/files/ok")).unwrap(), b"fine");
+        assert!(!outside.join("passwd").exists(), "wrote through a symlink entry");
+        assert!(std::fs::symlink_metadata(root.join("current/files/a")).is_err());
+        assert!(std::fs::symlink_metadata(root.join("current/files/x")).is_err());
+    }
+
+    #[test]
+    fn writes_never_follow_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("files");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("x")).unwrap();
+        assert!(mkdirs_inside(&base, Path::new("x/y")).is_err());
+        assert!(!outside.join("y").exists());
+        std::os::unix::fs::symlink(outside.join("t"), base.join("f")).unwrap();
+        assert!(write_file(&base.join("f"), b"z", 0o644).is_err());
+        assert!(!outside.join("t").exists());
+        mkdirs_inside(&base, Path::new("p/q")).unwrap();
+        assert!(base.join("p/q").is_dir());
+    }
+
+    #[tokio::test]
+    async fn head_rollback_below_high_water_mark_is_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let repo = mem_repo().await;
+        commit_files(&repo, "w", &[("/etc/a", b"one")], &[]).await;
+        commit_files(&repo, "w", &[("/etc/a", b"two")], &[]).await;
+        let r = restore_with(async { Ok(repo.clone()) }, "w", root, budget()).await;
+        assert_eq!(r.version, Some(2));
+        // An attacker replays the old HEAD (version 1).
+        let v1 = crate::ctx::manifest_at(&repo, "w", 1).await.unwrap();
+        let id = repo.write_manifest(&v1).await.unwrap();
+        let head = serde_json::to_vec(&crate::model::Head { manifest: id, seq: 1 }).unwrap();
+        repo.store.put("refs/w/HEAD", head.into()).await.unwrap();
+        let r = restore_with(async { Ok(repo.clone()) }, "w", root, budget()).await;
+        assert_eq!((r.mode, r.version), (Mode::Degraded, Some(2)), "{:?}", r.error);
+        assert_eq!(std::fs::read(root.join("current/files/etc/a")).unwrap(), b"two");
+        // A HEAD whose seq disagrees with its manifest is refused too.
+        let v2 = crate::ctx::manifest_at(&repo, "w", 1).await.unwrap();
+        let id = repo.write_manifest(&v2).await.unwrap();
+        let head = serde_json::to_vec(&crate::model::Head { manifest: id, seq: 5 }).unwrap();
+        repo.store.put("refs/w/HEAD", head.into()).await.unwrap();
+        assert!(matches!(crate::ctx::current(&repo, "w").await, Err(CarryError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn status_reports_failed_prefetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut m = crate::repo::tests::manifest(3, None);
+        m.apps.insert("jq".into(), Default::default());
+        m.apps.insert("yq".into(), Default::default());
+        std::fs::create_dir_all(root.join("gens/3")).unwrap();
+        std::fs::write(root.join("gens/3/manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+        switch_current(root, 3).unwrap();
+        std::fs::create_dir_all(root.join("cache/tools")).unwrap();
+        std::fs::write(root.join("cache/tools/status.json"), br#"{"jq":{"status":"failed","reason":"bad signature"}}"#).unwrap();
+        let s = Settings { repo: Some("s3://b/p".into()), root: root.into(), ..Default::default() };
+        let st = status(&s).await.unwrap();
+        assert_eq!(st["tools"][0], json!({"name": "jq", "status": "failed", "reason": "bad signature"}));
+        assert_eq!(st["tools"][1]["status"], "missing");
     }
 
     #[tokio::test]

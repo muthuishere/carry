@@ -46,7 +46,13 @@ pub async fn current(repo: &Repo, state: &str) -> Result<Option<(Head, String, M
     match repo.read_head(state).await? {
         None => Ok(None),
         Some((head, etag)) => {
-            let m = repo.load_manifest(&head.manifest).await?;
+            let m = repo.load_manifest(state, &head.manifest).await?;
+            if m.seq != head.seq {
+                return Err(CarryError::Invalid(format!(
+                    "HEAD of '{state}' says version {} but its manifest is version {}",
+                    head.seq, m.seq
+                )));
+            }
             Ok(Some((head, etag, m)))
         }
     }
@@ -61,7 +67,37 @@ pub fn empty_manifest(op: Op) -> Manifest {
         entries: BTreeMap::new(),
         env: BTreeMap::new(),
         apps: BTreeMap::new(),
+        state: String::new(),
     }
+}
+
+/// Another entry that makes `path` unrestorable: an ancestor (a file or symlink cannot also
+/// be a directory, and a symlink must never be traversed) or a descendant.
+pub fn path_conflict<V>(entries: &BTreeMap<String, V>, path: &str) -> Option<String> {
+    let mut p = path;
+    while let Some(i) = p.rfind('/') {
+        p = &p[..i];
+        if !p.is_empty() && entries.contains_key(p) {
+            return Some(p.to_string());
+        }
+    }
+    let dir = format!("{path}/");
+    entries.range(dir.clone()..).next().map(|(k, _)| k).filter(|k| k.starts_with(&dir)).cloned()
+}
+
+/// Refuse entries added or changed by an op that would conflict with another entry.
+fn check_new_entries(base: &Manifest, next: &Manifest) -> Result<()> {
+    for (p, e) in &next.entries {
+        if base.entries.get(p) == Some(e) {
+            continue;
+        }
+        if let Some(other) = path_conflict(&next.entries, p) {
+            return Err(CarryError::Usage(format!(
+                "{p} conflicts with existing entry {other}: a path cannot be both a file/symlink and a directory"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn make_op(kind: &str, args: Vec<String>) -> Op {
@@ -94,7 +130,8 @@ where
                 (m, None)
             }
         };
-        let mut next = f(base).await?;
+        let mut next = f(base.clone()).await?;
+        check_new_entries(&base, &next)?;
         next.op = make_op(kind, args.clone());
         next.format = FORMAT_VERSION;
         match repo.commit(state, etag, &next).await {
@@ -120,7 +157,22 @@ pub async fn manifest_at(repo: &Repo, state: &str, seq: u64) -> Result<Manifest>
     }
     while m.seq != seq {
         let p = m.parent.clone().ok_or_else(|| CarryError::NotFound(format!("version {seq} of '{state}'")))?;
-        m = repo.load_manifest(&p).await?;
+        m = repo.load_manifest(state, &p).await?;
     }
     Ok(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflicts() {
+        let e: BTreeMap<String, ()> = [("/a".to_string(), ()), ("/c/d/e".to_string(), ()), ("/ab".to_string(), ())].into_iter().collect();
+        assert_eq!(path_conflict(&e, "/a/b"), Some("/a".into()));
+        assert_eq!(path_conflict(&e, "/c"), Some("/c/d/e".into()));
+        assert_eq!(path_conflict(&e, "/c/d"), Some("/c/d/e".into()));
+        assert_eq!(path_conflict(&e, "/a"), None);
+        assert_eq!(path_conflict(&e, "/abc"), None);
+    }
 }

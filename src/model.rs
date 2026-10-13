@@ -68,6 +68,9 @@ pub struct Manifest {
     pub env: BTreeMap<String, String>,
     /// apps.lock: tool name -> reference.
     pub apps: BTreeMap<String, ToolRef>,
+    /// State this manifest belongs to (bound into its AEAD data). Empty in legacy manifests.
+    #[serde(default)]
+    pub state: String,
 }
 
 /// Signed tool metadata stored at tools/<name>/<version>/tool.json

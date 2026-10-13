@@ -291,7 +291,7 @@ pub async fn log_in(repo: &Repo, state: &str, limit: Option<usize>) -> Result<Va
             "by": m.op.by,
         }));
         match m.parent.clone() {
-            Some(p) => m = repo.load_manifest(&p).await?,
+            Some(p) => m = repo.load_manifest(state, &p).await?,
             None => break,
         }
     }
@@ -338,6 +338,18 @@ pub async fn rollback_in(repo: &Repo, state: &str, version: u64) -> Result<Value
     if version == 0 {
         return Err(CarryError::Usage("versions start at 1".into()));
     }
+    // ADR 0007: rollback holds the state's lease so two rollbacks never interleave.
+    // Correctness of every commit still rests on HEAD compare-and-swap.
+    let holder = format!("{}:{}:{:016x}", ctx::make_op("rollback", vec![]).by, std::process::id(), rand::random::<u64>());
+    let lease = repo.acquire_lease(state, &holder, None).await?;
+    let res = rollback_locked(repo, state, version).await;
+    if let Err(e) = repo.release_lease(lease).await {
+        eprintln!("carry: warning: cannot release lease on '{state}': {e}");
+    }
+    res
+}
+
+async fn rollback_locked(repo: &Repo, state: &str, version: u64) -> Result<Value> {
     let target = manifest_at(repo, state, version).await?;
     let head = mutate(repo, state, "rollback", vec![format!("v{version}")], |mut m: Manifest| {
         let t = target.clone();
@@ -567,6 +579,30 @@ mod tests {
         let top = &log_in(&r, "w", Some(1)).await.unwrap()["versions"][0];
         assert_eq!((top["op"].clone(), top["args"].clone()), (json!("rollback"), json!(["v2"])));
         assert!(matches!(rollback_in(&r, "w", 99).await, Err(CarryError::NotFound(_))));
+        // A rollback while another holder has the lease is refused.
+        r.acquire_lease("w", "other", None).await.unwrap();
+        assert!(matches!(rollback_in(&r, "w", 2).await, Err(CarryError::Conflict(_))));
+    }
+
+    #[tokio::test]
+    async fn ancestor_and_descendant_entries_are_refused() {
+        let r = repo().await;
+        put_in(&r, "w", "/a", b"1".to_vec(), 0o644).await.unwrap();
+        let e = put_in(&r, "w", "/a/b", b"2".to_vec(), 0o644).await.unwrap_err();
+        assert!(matches!(e, CarryError::Usage(_)) && e.exit_code() == 2, "{e:?}");
+        put_in(&r, "w", "/d/e", b"1".to_vec(), 0o644).await.unwrap();
+        assert!(matches!(put_in(&r, "w", "/d", b"2".to_vec(), 0o644).await, Err(CarryError::Usage(_))));
+        assert!(matches!(mv_in(&r, "w", "/a", "/d/e/f").await, Err(CarryError::Usage(_))));
+        // A symlink entry can never have entries beneath it (no writes through /x -> /etc).
+        mutate(&r, "w", "put", vec![], |mut m: Manifest| async move {
+            m.entries.insert("/x".into(), Entry { kind: EntryKind::Symlink, mode: 0o777, size: 4, blob: None, inline: None, target: Some("/etc".into()) });
+            Ok(m)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(put_in(&r, "w", "/x/passwd", b"p".to_vec(), 0o644).await, Err(CarryError::Usage(_))));
+        // Updating an existing, non-conflicting entry still works.
+        put_in(&r, "w", "/a", b"3".to_vec(), 0o644).await.unwrap();
     }
 
     #[test]

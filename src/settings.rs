@@ -119,8 +119,28 @@ impl std::fmt::Debug for Settings {
     }
 }
 
+/// Real env first, then the launcher settings file (`CARRY_LAUNCHER_ENV`, written by
+/// `carry run` for tool launchers whose env has the secrets stripped).
 fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty())
+    std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| launcher_env(name))
+}
+
+/// Value of `name` in the file named by CARRY_LAUNCHER_ENV. Ignored unless it is a
+/// regular file owned by the current user and not readable by group/other.
+fn launcher_env(name: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::env::var("CARRY_LAUNCHER_ENV").ok().filter(|v| !v.is_empty())?;
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if !md.is_file() || md.uid() != nix::unistd::geteuid().as_raw() || md.mode() & 0o077 != 0 {
+        return None;
+    }
+    std::fs::read_to_string(&path)
+        .ok()?
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim() == name)
+        .map(|(_, v)| v.to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn read_trimmed(path: &str, what: &str) -> Result<String> {
@@ -353,5 +373,21 @@ mod tests {
         std::env::remove_var("CARRY_REPO");
         g.repo = None;
         assert_eq!(Settings::resolve(&g).unwrap().repo.as_deref(), Some("s3://prof/x"));
+
+        // Launcher settings file: below real env, above the profile; must be private.
+        use std::os::unix::fs::PermissionsExt;
+        let lf = d.path().join("launcher.env");
+        std::fs::write(&lf, "CARRY_REPO=s3://launcher/x\nCARRY_KEY=lk\n").unwrap();
+        std::fs::set_permissions(&lf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::env::set_var("CARRY_LAUNCHER_ENV", &lf);
+        std::env::remove_var("CARRY_KEY");
+        let s = Settings::resolve(&g).unwrap();
+        assert_eq!((s.repo.as_deref(), s.master_key.as_deref()), (Some("s3://launcher/x"), Some("lk")));
+        std::env::set_var("CARRY_REPO", "s3://env/x");
+        assert_eq!(Settings::resolve(&g).unwrap().repo.as_deref(), Some("s3://env/x"));
+        std::env::remove_var("CARRY_REPO");
+        std::fs::set_permissions(&lf, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(Settings::resolve(&g).unwrap().repo.as_deref(), Some("s3://prof/x"));
+        std::env::remove_var("CARRY_LAUNCHER_ENV");
     }
 }
