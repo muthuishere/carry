@@ -4,7 +4,7 @@ Wrappers and scripts depend on this file. Changing it is a breaking change.
 
 ## Global flags
 `--profile <name>`, `--repo s3://bucket/prefix`, `--endpoint <url>`, `--region <r>`, `--json`, `--timeout <secs>` (default 30).
-Env: `CARRY_PROFILE`, `CARRY_REPO`, `CARRY_S3_ENDPOINT`, `CARRY_S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `CARRY_KEY` (base64 32 bytes) or `CARRY_KEY_FILE`, `CARRY_CONFIG`, `CARRY_ROOT` (default `/carry`), `CARRY_STATE` (state name used by `run`), `CARRY_TOOL_PUBKEY`, `CARRY_TOOL_SIGNING_KEY` / `CARRY_TOOL_SIGNING_KEY_FILE`, `CARRY_POLL_SECS` (default 30), `CARRY_RESTORE_BUDGET_MS` (default 2000), `CARRY_RELOAD_SIGNAL` (e.g. `HUP`), `CARRY_NO_ENCRYPTION=1` (tests only).
+Env: `CARRY_PROFILE`, `CARRY_TIMEOUT`, `CARRY_REPO`, `CARRY_S3_ENDPOINT`, `CARRY_S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `CARRY_KEY` (base64 32 bytes) or `CARRY_KEY_FILE`, `CARRY_CONFIG`, `CARRY_ROOT` (default `/carry`), `CARRY_STATE` (state name used by `run`), `CARRY_TOOL_PUBKEY`, `CARRY_TOOL_SIGNING_KEY` / `CARRY_TOOL_SIGNING_KEY_FILE`, `CARRY_POLL_SECS` (default 30), `CARRY_RESTORE_BUDGET_MS` (default 2000), `CARRY_RELOAD_SIGNAL` (e.g. `HUP`), `CARRY_NO_ENCRYPTION=1` (tests only).
 Precedence: flag > env > profile > default. No command ever prompts.
 
 ## JSON envelope (`--json`)
