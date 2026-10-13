@@ -47,7 +47,13 @@ pub enum Command {
     /// Check store reachability and capabilities
     Doctor,
     /// Upload a file (or `-` for stdin) to <state:path>
-    Put { target: String, source: String },
+    Put {
+        target: String,
+        source: String,
+        /// Octal permission bits, e.g. 0755 (default: source file mode, or 0644 for stdin)
+        #[arg(long)]
+        mode: Option<String>,
+    },
     /// Download <state:path> to stdout or a file
     Get { target: String, dest: Option<String> },
     /// List <state>[:<dir>]
@@ -374,9 +380,13 @@ async fn dispatch(cli: Cli) -> Result<Outcome> {
     let v = match cli.cmd {
         Command::Init => adapter::init(&s).await?,
         Command::Doctor => adapter::doctor(&s).await?,
-        Command::Put { target, source } => {
+        Command::Put { target, source, mode: mode_flag } => {
             let (state, path) = parse_state_path(&target)?;
-            let (bytes, mode) = read_source(&source)?;
+            let (bytes, mut mode) = read_source(&source)?;
+            if let Some(m) = mode_flag {
+                mode = u32::from_str_radix(m.trim_start_matches("0o"), 8)
+                    .map_err(|_| CarryError::Usage(format!("invalid --mode '{m}' (expected octal like 0644)")))?;
+            }
             adapter::put(&s, &state, &path, bytes, mode).await?
         }
         Command::Get { target, dest } => {

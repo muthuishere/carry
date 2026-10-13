@@ -30,7 +30,7 @@ A state path is `<state>:<absolute path>`, e.g. `web-1:/etc/app.yaml`.
 |---|---|
 | `init` | `{"repo": str, "created": bool, "encrypted": bool}` |
 | `doctor` | `{"reachable": bool, "conditional_writes": bool, "encrypted": bool|null, "checks": [{"name": str, "ok": bool, "detail": str}]}` |
-| `put <state:path> <file|->` | `{"state": str, "path": str, "version": int, "size": int, "uploaded": bool}` |
+| `put <state:path> <file|-> [--mode 0644]` | `{"state": str, "path": str, "version": int, "size": int, "uploaded": bool}` |
 | `get <state:path> [dest|-]` | to stdout as raw bytes without `--json`; with `--json`: `{"path": str, "size": int, "mode": int, "content_base64": str}` |
 | `ls <state>[:<dir>]` | `{"state": str, "version": int, "entries": [{"path": str, "kind": "file"|"symlink", "size": int, "mode": int}]}` |
 | `rm <state:path>` | `{"state": str, "path": str, "version": int}` |
@@ -38,7 +38,7 @@ A state path is `<state>:<absolute path>`, e.g. `web-1:/etc/app.yaml`.
 | `log <state> [--limit n]` | `{"state": str, "versions": [{"version": int, "op": str, "args": [str], "at": str, "by": str}]}` |
 | `diff <state> <v1> <v2>` | `{"added": [str], "removed": [str], "changed": [str], "env_changed": [str], "apps_changed": [str]}` |
 | `rollback <state> <version>` | `{"state": str, "version": int, "restored_from": int}` |
-| `env set <state> K=V...` / `env unset <state> K...` / `env import <state> <file>` | `{"state": str, "version": int, "keys": [str]}` |
+| `env set <state> K=V...` / `env unset <state> K...` / `env import <state> <file|->` | `{"state": str, "version": int, "keys": [str]}` |
 | `env get <state> [K]` | `{"state": str, "env": {K: V}}` |
 | `states` | `{"states": [{"name": str, "version": int}]}` |
 | `status` | `{"state": str|null, "mode": "ok"|"degraded"|"disabled", "version": int|null, "root": str, "last_restore_ms": int|null, "error": str|null, "tools": [{"name": str, "status": "ready"|"missing"|"failed"}]}` |
