@@ -7,6 +7,8 @@ Wrappers and scripts depend on this file. Changing it is a breaking change.
 Env: `CARRY_PROFILE`, `CARRY_TIMEOUT`, `CARRY_REPO`, `CARRY_S3_ENDPOINT`, `CARRY_S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `CARRY_KEY` (base64 32 bytes) or `CARRY_KEY_FILE`, `CARRY_CONFIG`, `CARRY_ROOT` (default `/carry`), `CARRY_STATE` (state name used by `run`), `CARRY_TOOL_PUBKEY`, `CARRY_TOOL_SIGNING_KEY` / `CARRY_TOOL_SIGNING_KEY_FILE`, `CARRY_POLL_SECS` (default 30), `CARRY_RESTORE_BUDGET_MS` (default 2000), `CARRY_RELOAD_SIGNAL` (e.g. `HUP`), `CARRY_NO_ENCRYPTION=1` (tests only).
 Precedence: flag > env > profile > default. No command ever prompts.
 
+`run` strips `CARRY_KEY`, `CARRY_KEY_FILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `CARRY_TOOL_SIGNING_KEY` and `CARRY_TOOL_SIGNING_KEY_FILE` from the app's environment. Tool launchers (children of the app) still reach the repo through `<root>/.launcher.env`: a `KEY=value` file (mode 0600, owned by the user running carry) holding `CARRY_REPO`, `CARRY_S3_ENDPOINT`, `CARRY_S3_REGION`, the AWS credentials, `CARRY_KEY` and `CARRY_TOOL_PUBKEY`; the app gets `CARRY_LAUNCHER_ENV=<root>/.launcher.env`. When `CARRY_LAUNCHER_ENV` is set, carry reads that file after the real env and before the profile (flag > env > launcher file > profile > default); the file is ignored unless it is a regular file owned by the current user with no group/other permissions. Note that the app runs as the same user and can read the file: this keeps secrets out of `/proc/<pid>/environ`, crash dumps and child processes that log their env, not out of a hostile app.
+
 ## JSON envelope (`--json`)
 Success: `{"ok": true, "result": <command-specific>}`
 Failure: `{"ok": false, "error": {"code": "<code>", "message": "<text>"}}`
@@ -41,7 +43,7 @@ A state path is `<state>:<absolute path>`, e.g. `web-1:/etc/app.yaml`.
 | `env set <state> K=V...` / `env unset <state> K...` / `env import <state> <file|->` | `{"state": str, "version": int, "keys": [str]}` |
 | `env get <state> [K]` | `{"state": str, "env": {K: V}}` |
 | `states` | `{"states": [{"name": str, "version": int}]}` |
-| `status` | `{"state": str|null, "mode": "ok"|"degraded"|"disabled", "version": int|null, "root": str, "last_restore_ms": int|null, "error": str|null, "tools": [{"name": str, "status": "ready"|"missing"|"failed"}]}` |
+| `status` | `{"state": str|null, "mode": "ok"|"degraded"|"disabled", "version": int|null, "root": str, "last_restore_ms": int|null, "error": str|null, "tools": [{"name": str, "status": "ready"|"missing"|"failed", "reason"?: str}]}` (`failed` comes from `<root>/cache/tools/status.json`, written by tool prefetch) |
 | `run -- <cmd...>` | not JSON; exits with the child's exit code |
 | `tool publish <name>@<ver> (--file p | --url u [--sha256 h]) --platform os/arch` | `{"name": str, "version": str, "platform": str, "sha256": str}` |
 | `tool promote <name>@<ver> --channel c` | `{"name": str, "channel": str, "version": str}` |

@@ -384,25 +384,33 @@ impl Repo {
 
     // ---- manifests & HEAD ----
 
+    /// Upload a manifest in the manifest domain, bound to `m.state`.
     pub async fn write_manifest(&self, m: &Manifest) -> Result<String> {
         let json = serde_json::to_vec(m).map_err(json_err)?;
-        let id = self.cipher.blob_id(&json);
+        let id = self.cipher.manifest_id(&json);
         let key = format!("manifests/{id}");
         if !self.store.exists(&key).await? {
-            let body = self.cipher.compress_seal(&json)?;
+            let body = self.cipher.seal_manifest(&json, &m.state)?;
             self.store.put_if_absent(&key, Bytes::from(body)).await?;
         }
         Ok(id)
     }
 
-    pub async fn load_manifest(&self, id: &str) -> Result<Manifest> {
+    /// Load and authenticate a manifest of `state`. A manifest recorded for another
+    /// state is rejected (it cannot be swapped between states).
+    pub async fn load_manifest(&self, state: &str, id: &str) -> Result<Manifest> {
         check_id(id)?;
         let raw = self.store.get(&format!("manifests/{id}")).await?;
-        let json = self.cipher.open_decompress(&raw)?;
-        if self.cipher.blob_id(&json) != id {
+        let (json, v2) = self.cipher.open_manifest(&raw, state)?;
+        let want = if v2 { self.cipher.manifest_id(&json) } else { self.cipher.blob_id(&json) };
+        if want != id {
             return Err(CarryError::Invalid(format!("manifest {id} does not match its id")));
         }
-        serde_json::from_slice(&json).map_err(json_err)
+        let m: Manifest = serde_json::from_slice(&json).map_err(json_err)?;
+        if v2 && m.state != state || !m.state.is_empty() && m.state != state {
+            return Err(CarryError::Invalid(format!("manifest {id} belongs to another state")));
+        }
+        Ok(m)
     }
 
     /// Current HEAD and its etag (for `commit`).
@@ -418,6 +426,9 @@ impl Repo {
     /// Conflict if someone else moved HEAD.
     pub async fn commit(&self, state: &str, expected_etag: Option<String>, manifest: &Manifest) -> Result<Head> {
         check_state(state)?;
+        let mut bound = manifest.clone();
+        bound.state = state.to_string();
+        let manifest = &bound;
         let id = self.write_manifest(manifest).await?;
         let head = Head { manifest: id, seq: manifest.seq };
         let body = Bytes::from(serde_json::to_vec(&head).map_err(json_err)?);
@@ -494,16 +505,23 @@ impl Repo {
         Ok(())
     }
 
-    /// Release if still ours (best effort; never deletes someone else's lease).
+    /// Release if still ours: only when the holder matches AND the lease object is
+    /// unchanged since we last wrote it. Instead of an unconditional delete it overwrites
+    /// the record with an already-expired one via If-Match, so a lease someone else took
+    /// over in the meantime is never touched.
     pub async fn release_lease(&self, lease: Lease) -> Result<()> {
         let key = lease_key(&lease.state);
-        if let Some((b, _)) = self.store.get_with_etag(&key).await? {
-            let cur: LeaseRecord = serde_json::from_slice(&b).map_err(json_err)?;
-            if cur.holder == lease.holder {
-                self.store.delete(&key).await?;
-            }
+        let Some((b, etag)) = self.store.get_with_etag(&key).await? else { return Ok(()) };
+        let cur: LeaseRecord = serde_json::from_slice(&b).map_err(json_err)?;
+        if cur.holder != lease.holder || etag != lease.etag {
+            return Ok(());
         }
-        Ok(())
+        let expired = LeaseRecord { holder: lease.holder.clone(), expires: DateTime::<Utc>::UNIX_EPOCH };
+        let body = Bytes::from(serde_json::to_vec(&expired).map_err(json_err)?);
+        match self.store.put_if_match(&key, body, &etag).await {
+            Ok(_) | Err(CarryError::Conflict(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     // ---- tool store ----
@@ -597,6 +615,7 @@ pub(crate) mod tests {
             entries: Default::default(),
             env: Default::default(),
             apps: Default::default(),
+            state: String::new(),
         }
     }
 
@@ -615,13 +634,24 @@ pub(crate) mod tests {
         r.commit("web-1", Some(etag.clone()), &manifest(2, Some(h.manifest.clone()))).await.unwrap();
         assert!(matches!(r.commit("web-1", Some(etag), &manifest(2, None)).await, Err(CarryError::Conflict(_))));
         assert_eq!(r.list_states().await.unwrap(), vec!["web-1"]);
-        assert_eq!(r.load_manifest(&h.manifest).await.unwrap().seq, 1);
+        assert_eq!(r.load_manifest("web-1", &h.manifest).await.unwrap().seq, 1);
 
         let mut l = r.acquire_lease("web-1", "a", None).await.unwrap();
         assert!(matches!(r.acquire_lease("web-1", "b", None).await, Err(CarryError::Conflict(_))));
         r.renew_lease(&mut l, None).await.unwrap();
         r.release_lease(l).await.unwrap();
-        r.acquire_lease("web-1", "b", None).await.unwrap();
+        let lb = r.acquire_lease("web-1", "b", None).await.unwrap();
+        // A stale holder's release must not touch b's lease.
+        let stale = Lease { state: "web-1".into(), holder: "b".into(), expires: Utc::now(), etag: "nope".into() };
+        r.release_lease(stale).await.unwrap();
+        assert!(matches!(r.acquire_lease("web-1", "c", None).await, Err(CarryError::Conflict(_))));
+        r.release_lease(lb).await.unwrap();
+        r.acquire_lease("web-1", "c", None).await.unwrap();
+
+        // Manifests are bound to their state: another state's manifest is refused.
+        let hb = r.commit("web-2", None, &manifest(1, None)).await.unwrap();
+        assert_eq!(r.load_manifest("web-2", &hb.manifest).await.unwrap().state, "web-2");
+        assert!(matches!(r.load_manifest("web-1", &hb.manifest).await, Err(CarryError::Invalid(_))));
 
         let t = r.put_tool_blob(b"bin").await.unwrap();
         assert_eq!(&r.get_tool_blob(&t).await.unwrap()[..], b"bin");
@@ -701,13 +731,13 @@ pub(crate) mod tests {
         // Intact again.
         assert!(check(raw.clone()).await.is_ok());
 
-        // Legacy headerless single-shot objects stay readable; new small ones carry FMT_SINGLE.
+        // Legacy headerless single-shot objects stay readable; new small ones carry FMT_SINGLE_V2 (blob-labelled AEAD).
         let small = b"legacy blob".to_vec();
         let sid = r.blob_id(&small);
         s.put(&blob_key(&sid), Bytes::from(r.cipher.compress_seal(&small).unwrap())).await.unwrap();
         assert_eq!(&r.get_blob(&sid).await.unwrap()[..], &small[..]);
         let nid = r.put_blob(b"fresh").await.unwrap();
-        assert_eq!(s.get(&blob_key(&nid)).await.unwrap()[0], crate::crypto::FMT_SINGLE);
+        assert_eq!(s.get(&blob_key(&nid)).await.unwrap()[0], crate::crypto::FMT_SINGLE_V2);
     }
 
     #[tokio::test]
