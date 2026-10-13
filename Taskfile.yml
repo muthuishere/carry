@@ -1,0 +1,39 @@
+version: "3"
+
+vars:
+  CARRY_IMAGE: '{{.CARRY_IMAGE | default "carry:dev"}}'
+  COMPOSE: docker compose -f examples/docker-compose.yml
+
+tasks:
+  build:
+    desc: Release build of the host binary
+    cmds: [cargo build --release --locked]
+
+  test:
+    desc: fmt check, clippy, unit tests (same as CI)
+    cmds:
+      - cargo fmt --all -- --check
+      - cargo clippy --all-targets --locked -- -D warnings
+      - cargo test --locked
+
+  image:
+    desc: Build the scratch image for the host arch as {{.CARRY_IMAGE}}
+    cmds: [docker build -t {{.CARRY_IMAGE}} .]
+
+  image:multi:
+    desc: Build linux/amd64 + linux/arm64 (cache only, no push)
+    cmds: [docker buildx build --platform linux/amd64,linux/arm64 -t {{.CARRY_IMAGE}} .]
+
+  e2e:
+    desc: Full end-to-end run against MinIO (pass --keep via CLI_ARGS to inspect)
+    cmds: [CARRY_IMAGE={{.CARRY_IMAGE}} ./examples/e2e.sh {{.CLI_ARGS}}]
+
+  minio-up:
+    desc: Start MinIO on :9000 (console :9001) and create bucket `carry`
+    cmds:
+      - '{{.COMPOSE}} up -d minio'
+      - '{{.COMPOSE}} run --rm minio-init'
+
+  minio-down:
+    desc: Stop MinIO and drop its data
+    cmds: ['{{.COMPOSE}} down -v --remove-orphans']

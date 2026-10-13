@@ -1,0 +1,49 @@
+# carry on Kubernetes (v0.1 shape): no init container, no sidecar.
+# The app image COPYs /carry and uses `carry run --` as its entrypoint; carry restores
+# state into an emptyDir at /carry (fail-open, 2 s budget), starts the app as a
+# supervised child, and polls for new versions.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels: {app: web}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      terminationGracePeriodSeconds: 20   # carry forwards SIGTERM to the app
+      containers:
+        - name: web
+          # Built from examples/nginx-config/Dockerfile:
+          #   COPY --from=$EMAIL_2/carry:0.1.0 /carry /usr/local/bin/carry
+          #   ENTRYPOINT ["carry","run","--"]
+          image: YOUR_REGISTRY/carry-example-nginx:0.1.0
+          args: ["nginx", "-g", "daemon off;"]
+          envFrom:
+            - secretRef: {name: carry-web}
+          env:
+            - {name: CARRY_STATE, value: web-1}
+            - {name: CARRY_ROOT, value: /carry}
+            - {name: CARRY_POLL_SECS, value: "30"}
+            - {name: CARRY_RESTORE_BUDGET_MS, value: "2000"}
+            - {name: CARRY_RELOAD_SIGNAL, value: HUP}
+          ports:
+            - {containerPort: 80, name: http}
+          # Probe the APP, never carry: a degraded carry must not take the pod out.
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          resources:
+            # carry targets < 20 MiB idle, hard cap 64 MiB (ADR 0005); add the app's own needs.
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: carry, mountPath: /carry}
+      volumes:
+        - name: carry
+          emptyDir:
+            sizeLimit: 512Mi   # generations + tool cache

@@ -1,0 +1,76 @@
+# Local playground: MinIO + the example apps.
+#   task image                                   # builds carry:dev
+#   docker compose -f examples/docker-compose.yml up -d minio minio-init
+#   CARRY_KEY=$(openssl rand -base64 32) docker compose -f examples/docker-compose.yml --profile apps up -d --build
+# examples/e2e.sh drives the same setup non-interactively.
+name: carry-examples
+
+networks:
+  default:
+    name: ${CARRY_NETWORK:-carry-e2e}
+
+services:
+  minio:
+    # minio/minio is no longer pullable from Docker Hub; chainguard/minio publishes :latest for free.
+    image: ${MINIO_IMAGE:-chainguard/minio:latest}
+    user: "0"
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-carry-e2e}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-carry-e2e-local-only}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+
+  # One-shot bucket creation with a SigV4-signed PUT (no mc image needed).
+  minio-init:
+    image: curlimages/curl:8.11.1
+    depends_on: [minio]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        for i in $$(seq 1 60); do
+          code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" --user "$${MINIO_ROOT_USER}:$${MINIO_ROOT_PASSWORD}" "http://minio:9000/$${CARRY_BUCKET}");
+          case "$$code" in 200|409) echo "bucket $${CARRY_BUCKET} ready"; exit 0;; esac;
+          sleep 0.5;
+        done; echo "bucket creation failed (last http $$code)"; exit 1
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-carry-e2e}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-carry-e2e-local-only}
+      CARRY_BUCKET: ${CARRY_BUCKET:-carry}
+    restart: "no"
+
+  web:
+    profiles: ["apps"]
+    build:
+      context: ./nginx-config
+      args:
+        CARRY_IMAGE: ${CARRY_IMAGE:-carry:dev}
+    image: carry-example-nginx:dev
+    environment: &carry-env
+      CARRY_REPO: s3://${CARRY_BUCKET:-carry}/${CARRY_PREFIX:-demo}
+      CARRY_S3_ENDPOINT: http://minio:9000
+      CARRY_S3_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-carry-e2e}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-carry-e2e-local-only}
+      CARRY_KEY: ${CARRY_KEY:-}
+      CARRY_POLL_SECS: ${CARRY_POLL_SECS:-5}
+      CARRY_STATE: web-1
+      CARRY_RELOAD_SIGNAL: HUP
+    ports:
+      - "${WEB_PORT:-8080}:80"
+
+  node:
+    profiles: ["apps"]
+    build:
+      context: ./node-tools
+      args:
+        CARRY_IMAGE: ${CARRY_IMAGE:-carry:dev}
+    image: carry-example-node:dev
+    environment:
+      <<: *carry-env
+      CARRY_STATE: tools-1
+      CARRY_RELOAD_SIGNAL: ""
+      CARRY_TOOL_PUBKEY: ${CARRY_TOOL_PUBKEY:-}
+    ports:
+      - "${NODE_PORT:-3000}:3000"

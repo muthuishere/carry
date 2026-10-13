@@ -1,0 +1,12 @@
+target/
+.git/
+.github/
+.claude/
+docs/
+openspec/
+examples/
+deploy/
+*.key
+.env
+Taskfile.yml
+README.md
