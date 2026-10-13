@@ -459,7 +459,7 @@ pub async fn status(s: &Settings) -> Result<Value> {
                         let reason = p.and_then(|v| v.get("reason")).cloned().unwrap_or(Value::Null);
                         return json!({"name": name, "status": "failed", "reason": reason});
                     }
-                    let ready = s.root.join("cache/tools").join(name).exists();
+                    let ready = p.and_then(|v| v.get("status")).and_then(Value::as_str) == Some("ready");
                     json!({"name": name, "status": if ready { "ready" } else { "missing" }})
                 })
                 .collect()
