@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # carry live demo: 3 dev-box replicas + 2 nginx replicas sharing state in MinIO,
 # real tools (jq, kubectl, gh) published once and installed on demand.
-# Uses only the published image ghcr.io/muthuishere/carry:0.1.0. Cleans up everything on exit.
+# Uses only the published image ghcr.io/muthuishere/carry:0.1.1. Cleans up everything on exit.
 set -uo pipefail
-IMG=ghcr.io/muthuishere/carry:0.1.0
+IMG=ghcr.io/muthuishere/carry:0.1.1
 N="carrydemo$$"
 NET="$N"
 W="$(mktemp -d)"

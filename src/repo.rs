@@ -168,6 +168,13 @@ impl Repo {
                 )
             })?;
             Cipher::Encrypted(DataKey::unwrap_any(&config.wrapped_keys, mk)?)
+        } else if mk.is_some() {
+            // A key was supplied, so the client expects encryption. Whoever can
+            // write the bucket must not be able to downgrade it to plaintext.
+            return Err(CarryError::BadKey(
+                "repository config says unencrypted but a key is set; refusing (possible downgrade)"
+                    .into(),
+            ));
         } else {
             Cipher::None
         };

@@ -9,7 +9,10 @@ use crate::settings::Settings;
 use crate::store::{Store, StoreConfig};
 use std::collections::BTreeMap;
 
-pub const MAX_COMMIT_RETRIES: usize = 5;
+/// Commit attempts are bounded by count and by wall time; backoff grows
+/// exponentially with full jitter so many concurrent writers spread out.
+pub const MAX_COMMIT_RETRIES: usize = 40;
+pub const COMMIT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub fn store_from(s: &Settings) -> Result<Store> {
     let url = s.repo.as_deref().ok_or_else(|| {
@@ -138,7 +141,11 @@ where
     Fut: std::future::Future<Output = Result<Manifest>>,
 {
     let mut last = None;
+    let started = std::time::Instant::now();
     for attempt in 0..MAX_COMMIT_RETRIES {
+        if attempt > 0 && started.elapsed() > COMMIT_RETRY_BUDGET {
+            break;
+        }
         let (base, etag) = match current(repo, state).await? {
             Some((head, etag, m)) => {
                 let mut m = m;
@@ -160,7 +167,8 @@ where
             Ok(h) => return Ok(h),
             Err(CarryError::Conflict(msg)) => {
                 last = Some(msg);
-                let jitter = 20 + (rand::random::<u64>() % 80) * (attempt as u64 + 1);
+                let cap = (25u64 << attempt.min(6)).min(1500);
+                let jitter = 10 + rand::random::<u64>() % cap;
                 tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
             }
             Err(e) => return Err(e),

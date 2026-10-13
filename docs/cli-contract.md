@@ -22,7 +22,7 @@ Exactly one JSON object on stdout. Logs go to stderr.
 | 2 | usage, read-only profile, not found | usage, readonly, not_found |
 | 3 | store unreachable | unreachable |
 | 4 | store refused / invalid data / bad key | refused, invalid, bad_key |
-| 5 | conflict not resolved after retries | conflict |
+| 5 | conflict not resolved after retries (up to 40 attempts or 15 s, exponential backoff with jitter) | conflict |
 
 ## Paths
 A state path is `<state>:<absolute path>`, e.g. `web-1:/etc/app.yaml`.

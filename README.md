@@ -15,7 +15,7 @@ Containers lose everything added after the image was built. carry restores confi
 
 ```dockerfile
 FROM nginx:1.27
-COPY --from=ghcr.io/muthuishere/carry:0.1.0 /carry /usr/local/bin/carry
+COPY --from=ghcr.io/muthuishere/carry:0.1.1 /carry /usr/local/bin/carry
 ENTRYPOINT ["carry", "run", "--"]
 CMD ["nginx", "-g", "daemon off;"]
 ```
@@ -29,6 +29,8 @@ docker run \
   -e CARRY_KEY_FILE=/run/secrets/carry-key \
   my-nginx
 ```
+
+The same image is on Docker Hub as `muthuishere/carry:0.1.1`.
 
 Without `CARRY_REPO`, `carry run --` simply runs your command, so the image still works with no bucket.
 
