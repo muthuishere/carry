@@ -123,11 +123,13 @@ where
 
 // ---------------------------------------------------------------- commands
 
-pub async fn keygen(_s: &Settings) -> Result<Value> {
-    // The CLI has no --out flag; the key goes to the documented default path.
-    let out = dirs::home_dir()
-        .map(|h| h.join(".config/carry/tool-signing.key"))
-        .ok_or_else(|| CarryError::Usage("cannot determine key file path".into()))?;
+pub async fn keygen(_s: &Settings, out: Option<&Path>) -> Result<Value> {
+    let out = match out {
+        Some(p) => p.to_path_buf(),
+        None => dirs::home_dir()
+            .map(|h| h.join(".config/carry/tool-signing.key"))
+            .ok_or_else(|| CarryError::Usage("cannot determine key file path".into()))?,
+    };
     keygen_to(&out)
 }
 
@@ -176,8 +178,19 @@ pub async fn publish(s: &Settings, name: &str, version: &str, src: ToolSource, p
     }
     let sk = signing_key(s)?;
     let me = crypto::ed25519_public(&sk)?;
-    let bytes = match src {
-        ToolSource::File(p) => std::fs::read(&p).map_err(|e| CarryError::Usage(format!("cannot read {}: {e}", p.display())))?,
+    let repo = ctx::open_repo_for_write(s).await?;
+    let (sha, size, blob) = match src {
+        ToolSource::File(p) => {
+            // Stream from disk: sha256 pass here, then the repo hashes and uploads in bounded chunks.
+            let ue = |e: std::io::Error| CarryError::Usage(format!("cannot read {}: {e}", p.display()));
+            let mut f = std::fs::File::open(&p).map_err(ue)?;
+            let size = f.metadata().map_err(ue)?.len();
+            let mut h = Sha256::new();
+            std::io::copy(&mut f, &mut ShaSink(&mut h)).map_err(ue)?;
+            let sha = hex::encode(h.finalize());
+            let (blob, _) = repo.put_tool_blob_from(f, size).await?;
+            (sha, size, blob)
+        }
         ToolSource::Url { url, sha256 } => {
             let b = download(&url).await?;
             if let Some(want) = sha256 {
@@ -186,13 +199,10 @@ pub async fn publish(s: &Settings, name: &str, version: &str, src: ToolSource, p
                     return Err(CarryError::Invalid(format!("sha256 mismatch for {url}: got {got}")));
                 }
             }
-            b
+            (sha256_hex(&b), b.len() as u64, repo.put_tool_blob(&b).await?)
         }
     };
-    let sha = sha256_hex(&bytes);
-    let repo = ctx::open_repo_for_write(s).await?;
-    let blob = repo.put_tool_blob(&bytes).await?;
-    let build = ToolBuild { sha256: sha.clone(), size: bytes.len() as u64, blob };
+    let build = ToolBuild { sha256: sha.clone(), size, blob };
     rmw::<SignedToolMeta, _>(&repo, &meta_key(name, version), |old| {
         let meta = match old {
             Some(old) => {
@@ -429,7 +439,26 @@ fn prepare(name: &str) -> std::result::Result<PathBuf, String> {
 
     // Fast path: pinned version with verified metadata and binary already cached.
     if let Some(v) = &r.version {
-        if let Some(bin) = cached_binary(&root, &meta_cache.join(format!("{v}.json")), &pubkey, &platform) {
+        let mf = meta_cache.join(format!("{v}.json"));
+        if let Some(bin) = cached_binary(&root, &mf, &pubkey, &platform) {
+            // Best effort: honour a yank if the store answers within 1 s; offline -> run cached.
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+            if let Ok(rt) = rt {
+                let fetch_meta = async {
+                    let s = Settings::resolve(&crate::cli::GlobalArgs::default())?;
+                    let repo = ctx::open_repo(&s).await?;
+                    repo.get_tool_json::<SignedToolMeta>(&meta_key(name, v)).await
+                };
+                let fresh = rt.block_on(yank_check(fetch_meta, &pubkey, YANK_CHECK_BUDGET));
+                rt.shutdown_background();
+                if let Some(m) = fresh.filter(|m| m.meta.yanked) {
+                    // Persist so later offline launches refuse too.
+                    if let Ok(b) = serde_json::to_vec(&m) {
+                        let _ = std::fs::write(&mf, b);
+                    }
+                    return Err(format!("refused: {name}@{v} is yanked"));
+                }
+            }
             return Ok(bin);
         }
     }
@@ -439,6 +468,19 @@ fn prepare(name: &str) -> std::result::Result<PathBuf, String> {
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
     rt.block_on(fetch(name, r, &root, &pubkey, &platform, &meta_cache))
+}
+
+const YANK_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Fetch fresh metadata within `budget`. Returns it only if it arrived in time and is
+/// signed by `pubkey`; any error, timeout or bad signature yields None (keep the cache).
+async fn yank_check<F>(fetch: F, pubkey: &str, budget: std::time::Duration) -> Option<SignedToolMeta>
+where
+    F: std::future::Future<Output = Result<Option<SignedToolMeta>>>,
+{
+    let m = tokio::time::timeout(budget, fetch).await.ok()?.ok()??;
+    verify_meta(&m, pubkey).ok()?;
+    Some(m)
 }
 
 fn cached_binary(root: &Path, meta_file: &Path, pubkey: &str, platform: &str) -> Option<PathBuf> {
@@ -486,13 +528,19 @@ async fn fetch(
         .map_err(|(_, e)| format!("lock: {e}"))?;
 
     if !bin.is_file() {
-        let data = repo.get_tool_blob(&build.blob).await.map_err(|e| e.to_string())?;
-        let got = sha256_hex(&data);
+        let tmp = dir.join(format!(".{}.tmp{}", build.sha256, std::process::id()));
+        let got = download_blob(&repo, &build.blob, &tmp).await;
+        let got = match got {
+            Ok(g) => g,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
         if got != build.sha256 {
+            let _ = std::fs::remove_file(&tmp);
             return Err(format!("refused: sha256 mismatch (want {}, got {got})", build.sha256));
         }
-        let tmp = dir.join(format!(".{}.tmp{}", build.sha256, std::process::id()));
-        std::fs::write(&tmp, &data).map_err(|e| format!("cache write: {e}"))?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).map_err(|e| format!("chmod: {e}"))?;
         std::fs::rename(&tmp, &bin).map_err(|e| format!("cache rename: {e}"))?;
@@ -508,6 +556,46 @@ async fn fetch(
         }
     }
     Ok(bin)
+}
+
+struct ShaSink<'a>(&'a mut Sha256);
+impl std::io::Write for ShaSink<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.update(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Writer that hashes (SHA-256) everything passing through.
+struct Sha256Writer<W> {
+    inner: W,
+    h: sha2::Sha256,
+}
+
+impl<W: std::io::Write> std::io::Write for Sha256Writer<W> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        let n = self.inner.write(b)?;
+        self.h.update(&b[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Stream a tool blob to `dest` with bounded memory; returns its sha256 hex.
+async fn download_blob(repo: &Repo, blob: &str, dest: &Path) -> std::result::Result<String, String> {
+    use sha2::Digest;
+    let f = std::fs::File::create(dest).map_err(|e| format!("cache write: {e}"))?;
+    let mut w = Sha256Writer { inner: std::io::BufWriter::with_capacity(256 << 10, f), h: sha2::Sha256::new() };
+    repo.get_tool_blob_to(blob, &mut w).await.map_err(|e| e.to_string())?;
+    let f = w.inner.into_inner().map_err(|e| format!("cache write: {}", e.error()))?;
+    f.sync_all().map_err(|e| format!("cache write: {e}"))?;
+    Ok(hex::encode(w.h.finalize()))
 }
 
 #[cfg(test)]
@@ -572,6 +660,27 @@ mod tests {
         assert_eq!(resolve_version("jq", &dflt, Some(&ch)).unwrap(), "1.7");
         let beta = ToolRef { channel: Some("beta".into()), ..Default::default() };
         assert!(resolve_version("jq", &beta, Some(&ch)).is_err());
+    }
+
+    #[tokio::test]
+    async fn yank_check_is_best_effort() {
+        let (sk, pk) = crypto::ed25519_keygen();
+        let y = sign_meta(meta(true), &sk).unwrap();
+        let b = std::time::Duration::from_secs(1);
+        let got = yank_check(async { Ok(Some(y.clone())) }, &pk, b).await;
+        assert!(got.unwrap().meta.yanked);
+        // Unreachable store: silently skipped, within the budget.
+        let t = std::time::Instant::now();
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Ok(Some(y.clone()))
+        };
+        assert!(yank_check(slow, &pk, b).await.is_none());
+        assert!(t.elapsed() < std::time::Duration::from_millis(1500));
+        assert!(yank_check(async { Err(CarryError::Unreachable("down".into())) }, &pk, b).await.is_none());
+        // Forged metadata cannot yank (or un-yank) anything.
+        let (_, other) = crypto::ed25519_keygen();
+        assert!(yank_check(async { Ok(Some(y.clone())) }, &other, b).await.is_none());
     }
 
     #[test]

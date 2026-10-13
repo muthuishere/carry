@@ -234,7 +234,13 @@ impl Settings {
         let signing_key = if let Some(k) = env("CARRY_TOOL_SIGNING_KEY") {
             Some(k)
         } else if let Some(f) = env("CARRY_TOOL_SIGNING_KEY_FILE") {
-            Some(read_trimmed(&f, "signing key")?)
+            // A missing file is tolerated (e.g. `tool keygen` is about to create it);
+            // commands that need the key report "no signing key" later.
+            if expand(&f).exists() {
+                Some(read_trimmed(&f, "signing key")?)
+            } else {
+                None
+            }
         } else {
             None
         };

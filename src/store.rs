@@ -195,6 +195,20 @@ impl Store {
         Ok(n)
     }
 
+    /// Object body as a stream of byte chunks (nothing buffered beyond one chunk).
+    pub async fn get_stream(
+        &self,
+        key: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<Bytes>>> {
+        let r = self.inner.get(&self.path(key)).await.map_err(map_err)?;
+        Ok(r.into_stream().map(|c| c.map_err(map_err)).boxed())
+    }
+
+    /// Start a multipart upload (parts must be >= 5 MiB except the last on S3).
+    pub async fn put_multipart(&self, key: &str) -> Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart(&self.path(key)).await.map_err(map_err)
+    }
+
     pub async fn put(&self, key: &str, bytes: Bytes) -> Result<String> {
         let r = self
             .inner

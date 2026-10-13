@@ -142,6 +142,40 @@ pub async fn put_in(repo: &Repo, state: &str, path: &str, bytes: Vec<u8>, mode: 
     Ok(json!({"state": state, "path": path, "version": head.seq, "size": size, "uploaded": uploaded}))
 }
 
+/// `put` from a file on disk. Large files stream (hash pass + bounded chunked upload)
+/// instead of being read into memory.
+pub async fn put_file(s: &Settings, state: &str, path: &str, file: &std::path::Path, mode: u32) -> Result<Value> {
+    check_state(state)?;
+    check_path(path)?;
+    put_file_in(&open_repo_for_write(s).await?, state, path, file, mode).await
+}
+
+pub async fn put_file_in(repo: &Repo, state: &str, path: &str, file: &std::path::Path, mode: u32) -> Result<Value> {
+    check_state(state)?;
+    check_path(path)?;
+    let ue = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => CarryError::NotFound(file.display().to_string()),
+        _ => CarryError::Usage(format!("cannot read {}: {e}", file.display())),
+    };
+    let f = std::fs::File::open(file).map_err(ue)?;
+    let size = f.metadata().map_err(ue)?.len();
+    if size <= crate::crypto::CHUNK_THRESHOLD {
+        let bytes = std::fs::read(file).map_err(ue)?;
+        return put_in(repo, state, path, bytes, mode).await;
+    }
+    let (id, uploaded) = repo.put_blob_from(f, size).await?;
+    let entry = Entry { kind: EntryKind::File, mode, size, blob: Some(id), inline: None, target: None };
+    let head = mutate(repo, state, "put", vec![path.to_string()], |mut m: Manifest| {
+        let e = entry.clone();
+        async move {
+            m.entries.insert(path.to_string(), e);
+            Ok(m)
+        }
+    })
+    .await?;
+    Ok(json!({"state": state, "path": path, "version": head.seq, "size": size, "uploaded": uploaded}))
+}
+
 pub async fn get(s: &Settings, state: &str, path: &str) -> Result<GetOutput> {
     check_state(state)?;
     check_path(path)?;
