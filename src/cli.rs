@@ -591,13 +591,13 @@ mod adapter {
         eprintln!("carry: not implemented: run");
         1
     }
-    pub async fn tool_publish(_s: &Settings, _name: &str, _ver: &str, _src: ToolSource, _platform: &str) -> Result<Value> { todo_dispatch("tool publish") }
-    pub async fn tool_promote(_s: &Settings, _name: &str, _ver: &str, _channel: &str) -> Result<Value> { todo_dispatch("tool promote") }
-    pub async fn tool_yank(_s: &Settings, _name: &str, _ver: &str) -> Result<Value> { todo_dispatch("tool yank") }
-    pub async fn tool_ls(_s: &Settings, _name: Option<&str>) -> Result<Value> { todo_dispatch("tool ls") }
-    pub async fn tool_add(_s: &Settings, _state: &str, _name: &str, _r: ToolRef) -> Result<Value> { todo_dispatch("tool add") }
-    pub async fn tool_rm(_s: &Settings, _state: &str, _name: &str) -> Result<Value> { todo_dispatch("tool rm") }
-    pub async fn tool_keygen(_s: &Settings) -> Result<Value> { todo_dispatch("tool keygen") }
+    pub async fn tool_publish(s: &Settings, name: &str, ver: &str, src: ToolSource, platform: &str) -> Result<Value> { crate::tools::publish(s, name, ver, src, platform).await }
+    pub async fn tool_promote(s: &Settings, name: &str, ver: &str, channel: &str) -> Result<Value> { crate::tools::promote(s, name, ver, channel).await }
+    pub async fn tool_yank(s: &Settings, name: &str, ver: &str) -> Result<Value> { crate::tools::yank(s, name, ver).await }
+    pub async fn tool_ls(s: &Settings, name: Option<&str>) -> Result<Value> { crate::tools::ls(s, name).await }
+    pub async fn tool_add(s: &Settings, state: &str, name: &str, r: ToolRef) -> Result<Value> { crate::tools::add(s, state, name, r).await }
+    pub async fn tool_rm(s: &Settings, state: &str, name: &str) -> Result<Value> { crate::tools::rm(s, state, name).await }
+    pub async fn tool_keygen(s: &Settings) -> Result<Value> { crate::tools::keygen(s).await }
 }
 
 #[cfg(test)]
