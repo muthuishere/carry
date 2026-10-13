@@ -1270,16 +1270,3 @@ mod tests {
         assert!(d.path().join("cache/tools").join(sha256_hex(b"jq-binary")).is_file());
     }
 }
-
-// STUB: replaced by tools engineer
-/// Fetch and verify the given tools into the cache. Stub until tools.rs lands it.
-#[allow(dead_code, unused_variables)]
-pub async fn prefetch_tools(
-    settings: &Settings,
-    root: &Path,
-    apps: &std::collections::BTreeMap<String, ToolRef>,
-    only_required: bool,
-) -> Vec<(String, std::result::Result<(), String>)> {
-    Vec::new()
-}
-// END STUB
