@@ -2,3 +2,4 @@ target/
 *.key
 .env
 examples/**/data/
+.claude/worktrees/
