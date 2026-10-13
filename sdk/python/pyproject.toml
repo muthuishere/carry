@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carry-sdk"
+version = "0.1.0"
+description = "Thin Python wrapper over the carry CLI JSON interface"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = []
+
+[tool.setuptools]
+packages = ["carry_sdk"]

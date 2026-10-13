@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Stub `carry` binary emulating docs/cli-contract.md for SDK tests.
+
+State lives in a JSON file at $FAKE_CARRY_DB. Any argument containing
+"conflict" exits 5, "unreachable" exits 3, "badkey" exits 4 (bad_key).
+Each call records argv and CARRY_* env in the db under "last_call".
+"""
+import base64
+import datetime
+import json
+import os
+import sys
+
+DB = os.environ.get("FAKE_CARRY_DB", "fake-carry-db.json")
+EXIT = {"usage": 2, "not_found": 2, "readonly": 2, "unreachable": 3,
+        "refused": 4, "invalid": 4, "bad_key": 4, "conflict": 5, "internal": 1}
+VALUE_FLAGS = ("--profile", "--repo", "--endpoint", "--region", "--timeout",
+               "--mode", "--limit", "--channel")
+BOOL_FLAGS = ("--json", "--prefetch", "--required")
+
+
+def load():
+    try:
+        with open(DB) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"states": {}}
+
+
+def save(db):
+    with open(DB, "w") as f:
+        json.dump(db, f)
+
+
+def out(result):
+    print(json.dumps({"ok": True, "result": result}))
+    sys.exit(0)
+
+
+def fail(code, msg):
+    print(json.dumps({"ok": False, "error": {"code": code, "message": msg}}))
+    sys.exit(EXIT[code])
+
+
+def state(db, name):
+    return db["states"].setdefault(
+        name, {"version": 0, "files": {}, "env": {}, "tools": [], "log": []})
+
+
+def bump(st, op, args):
+    st["version"] += 1
+    st["log"].append({"version": st["version"], "op": op, "args": args,
+                      "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                      "by": "fake"})
+    return st["version"]
+
+
+def split(sp):
+    if ":" not in sp:
+        fail("usage", "expected <state>:<path>")
+    return sp.split(":", 1)
+
+
+def main():
+    argv = sys.argv[1:]
+    glob, rest, i = {}, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in VALUE_FLAGS:
+            glob[a[2:]] = argv[i + 1]
+            i += 2
+        elif a in BOOL_FLAGS:
+            glob[a[2:]] = True
+            i += 1
+        else:
+            rest.append(a)
+            i += 1
+    db = load()
+    db["last_call"] = {"argv": argv, "env": {k: v for k, v in os.environ.items()
+                                             if k.startswith("CARRY_") and k != "CARRY_BIN"}}
+    save(db)
+    joined = " ".join(rest)
+    if "unreachable" in joined:
+        fail("unreachable", "store unreachable")
+    if "conflict" in joined:
+        fail("conflict", "conflict not resolved after retries")
+    if "badkey" in joined:
+        fail("bad_key", "bad key")
+    if not rest:
+        fail("usage", "no command")
+    cmd, args = rest[0], rest[1:]
+
+    if cmd == "put":
+        s, p = split(args[0])
+        data = sys.stdin.buffer.read() if args[1] == "-" else open(args[1], "rb").read()
+        st = state(db, s)
+        st["files"][p] = {"b64": base64.b64encode(data).decode(),
+                          "mode": int(glob.get("mode", "644"), 8)}
+        v = bump(st, "put", [p])
+        save(db)
+        out({"state": s, "path": p, "version": v, "size": len(data), "uploaded": True})
+    if cmd == "get":
+        s, p = split(args[0])
+        f = state(db, s)["files"].get(p)
+        if f is None:
+            fail("not_found", p + " not found")
+        out({"path": p, "size": len(base64.b64decode(f["b64"])), "mode": f["mode"],
+             "content_base64": f["b64"]})
+    if cmd == "ls":
+        s = args[0].split(":", 1)[0]
+        st = state(db, s)
+        out({"state": s, "version": st["version"], "entries": [
+            {"path": p, "kind": "file", "size": len(base64.b64decode(f["b64"])), "mode": f["mode"]}
+            for p, f in sorted(st["files"].items())]})
+    if cmd == "rm":
+        s, p = split(args[0])
+        st = state(db, s)
+        if p not in st["files"]:
+            fail("not_found", p + " not found")
+        del st["files"][p]
+        v = bump(st, "rm", [p])
+        save(db)
+        out({"state": s, "path": p, "version": v})
+    if cmd == "mv":
+        s, p = split(args[0])
+        st = state(db, s)
+        if p not in st["files"]:
+            fail("not_found", p + " not found")
+        st["files"][args[1]] = st["files"].pop(p)
+        v = bump(st, "mv", [p, args[1]])
+        save(db)
+        out({"state": s, "from": p, "to": args[1], "version": v})
+    if cmd == "log":
+        vs = list(reversed(state(db, args[0])["log"]))
+        if "limit" in glob:
+            vs = vs[: int(glob["limit"])]
+        out({"state": args[0], "versions": vs})
+    if cmd == "diff":
+        out({"added": [], "removed": [], "changed": [], "env_changed": [], "apps_changed": []})
+    if cmd == "rollback":
+        st = state(db, args[0])
+        v = bump(st, "rollback", [args[1]])
+        save(db)
+        out({"state": args[0], "version": v, "restored_from": int(args[1])})
+    if cmd == "env":
+        sub, s = args[0], args[1]
+        st = state(db, s)
+        if sub == "get":
+            env = st["env"]
+            if len(args) > 2:
+                if args[2] not in env:
+                    fail("not_found", args[2] + " not set")
+                env = {args[2]: env[args[2]]}
+            out({"state": s, "env": env})
+        if sub == "unset":
+            for k in args[2:]:
+                st["env"].pop(k, None)
+            v = bump(st, "env unset", args[2:])
+            save(db)
+            out({"state": s, "version": v, "keys": args[2:]})
+        if sub == "set":
+            kv = dict(a.split("=", 1) for a in args[2:])
+        elif sub == "import":
+            text = sys.stdin.read() if args[2] == "-" else open(args[2]).read()
+            kv = dict(l.split("=", 1) for l in text.splitlines()
+                      if "=" in l and not l.startswith("#"))
+        else:
+            fail("usage", "unknown env subcommand " + sub)
+        st["env"].update(kv)
+        v = bump(st, "env " + sub, sorted(kv))
+        save(db)
+        out({"state": s, "version": v, "keys": sorted(kv)})
+    if cmd == "tool" and args and args[0] == "add":
+        s, t = args[1], args[2]
+        st = state(db, s)
+        st["tools"].append(t)
+        v = bump(st, "tool add", [t])
+        save(db)
+        out({"state": s, "version": v, "tool": t})
+    if cmd == "states":
+        out({"states": [{"name": n, "version": st["version"]}
+                        for n, st in sorted(db["states"].items())]})
+    if cmd == "status":
+        s = os.environ.get("CARRY_STATE")
+        st = db["states"].get(s) if s else None
+        out({"state": s, "mode": "ok", "version": st["version"] if st else None,
+             "root": "/carry", "last_restore_ms": None, "error": None,
+             "tools": [{"name": t.split("@")[0], "status": "ready"}
+                       for t in (st["tools"] if st else [])]})
+    fail("usage", "unknown command " + cmd)
+
+
+if __name__ == "__main__":
+    main()
