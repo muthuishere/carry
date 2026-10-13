@@ -586,11 +586,8 @@ mod adapter {
     pub async fn env_import(_s: &Settings, _state: &str, _text: &str) -> Result<Value> { todo_dispatch("env import") }
     pub async fn env_get(_s: &Settings, _state: &str, _key: Option<&str>) -> Result<Value> { todo_dispatch("env get") }
     pub async fn states(_s: &Settings) -> Result<Value> { todo_dispatch("states") }
-    pub async fn status(_s: &Settings) -> Result<Value> { todo_dispatch("status") }
-    pub async fn run(_s: &Settings, _cmd: Vec<String>) -> i32 {
-        eprintln!("carry: not implemented: run");
-        1
-    }
+    pub async fn status(s: &Settings) -> Result<Value> { crate::restore::status(s).await }
+    pub async fn run(s: &Settings, cmd: Vec<String>) -> i32 { crate::run::run(s, cmd).await }
     pub async fn tool_publish(_s: &Settings, _name: &str, _ver: &str, _src: ToolSource, _platform: &str) -> Result<Value> { todo_dispatch("tool publish") }
     pub async fn tool_promote(_s: &Settings, _name: &str, _ver: &str, _channel: &str) -> Result<Value> { todo_dispatch("tool promote") }
     pub async fn tool_yank(_s: &Settings, _name: &str, _ver: &str) -> Result<Value> { todo_dispatch("tool yank") }
