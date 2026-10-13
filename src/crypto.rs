@@ -1,2 +1,314 @@
+//! Keys, AEAD, keyed ids, signatures (ADR 0004).
 //! See openspec/changes/carry-v0-1/design.md for this module's surface.
-#![allow(dead_code, unused)]
+#![allow(dead_code)]
+
+use crate::error::{CarryError, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+
+pub const NONCE_LEN: usize = 24;
+pub const ZSTD_LEVEL: i32 = 3;
+
+/// A 256-bit master key. Never printed.
+#[derive(Clone)]
+pub struct MasterKey([u8; 32]);
+
+impl std::fmt::Debug for MasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MasterKey({})", self.key_id())
+    }
+}
+
+impl MasterKey {
+    pub fn generate() -> Self {
+        let mut k = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut k);
+        MasterKey(k)
+    }
+    pub fn from_bytes(b: [u8; 32]) -> Self {
+        MasterKey(b)
+    }
+    pub fn from_base64(s: &str) -> Result<Self> {
+        let raw = B64
+            .decode(s.trim())
+            .map_err(|_| CarryError::BadKey("master key is not valid base64".into()))?;
+        let arr: [u8; 32] = raw
+            .try_into()
+            .map_err(|_| CarryError::BadKey("master key must be 32 bytes".into()))?;
+        Ok(MasterKey(arr))
+    }
+    pub fn to_base64(&self) -> String {
+        B64.encode(self.0)
+    }
+    pub fn from_file(path: &std::path::Path) -> Result<Self> {
+        let s = std::fs::read_to_string(path)
+            .map_err(|e| CarryError::BadKey(format!("cannot read key file {}: {e}", path.display())))?;
+        Self::from_base64(&s)
+    }
+    /// `CARRY_KEY` (base64) or `CARRY_KEY_FILE`. Ok(None) when neither is set.
+    pub fn from_env() -> Result<Option<Self>> {
+        if let Ok(k) = std::env::var("CARRY_KEY") {
+            if !k.trim().is_empty() {
+                return Self::from_base64(&k).map(Some);
+            }
+        }
+        if let Ok(p) = std::env::var("CARRY_KEY_FILE") {
+            if !p.trim().is_empty() {
+                return Self::from_file(std::path::Path::new(&p)).map(Some);
+            }
+        }
+        Ok(None)
+    }
+    /// Non-secret identifier used to pick the matching wrapped key.
+    pub fn key_id(&self) -> String {
+        hex::encode(&blake3::derive_key("carry master key id v1", &self.0)[..8])
+    }
+    fn cipher(&self) -> XChaCha20Poly1305 {
+        XChaCha20Poly1305::new((&self.0).into())
+    }
+}
+
+/// The repo data key, wrapped in `config` by one or more master keys.
+#[derive(Clone)]
+pub struct DataKey {
+    key: [u8; 32],
+    id_key: [u8; 32],
+}
+
+impl std::fmt::Debug for DataKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DataKey(..)")
+    }
+}
+
+/// One wrapped copy of the data key as stored in `config`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WrappedKey {
+    /// MasterKey::key_id of the wrapping key.
+    pub kid: String,
+    /// base64(nonce || ciphertext)
+    pub data: String,
+}
+
+impl DataKey {
+    pub fn generate() -> Self {
+        let mut k = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut k);
+        Self::from_raw(k)
+    }
+    fn from_raw(key: [u8; 32]) -> Self {
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, &key);
+        let mut id_key = [0u8; 32];
+        hk.expand(b"carry blob id", &mut id_key).expect("32 bytes is a valid hkdf length");
+        DataKey { key, id_key }
+    }
+    pub fn wrap(&self, mk: &MasterKey) -> WrappedKey {
+        let sealed = seal_raw(&mk.cipher(), &self.key, b"carry data key v1");
+        WrappedKey { kid: mk.key_id(), data: B64.encode(sealed) }
+    }
+    pub fn unwrap(w: &WrappedKey, mk: &MasterKey) -> Result<Self> {
+        if w.kid != mk.key_id() {
+            return Err(CarryError::BadKey("master key does not match this repository".into()));
+        }
+        let raw = B64.decode(&w.data).map_err(|_| CarryError::Invalid("wrapped key not base64".into()))?;
+        let pt = open_raw(&mk.cipher(), &raw, b"carry data key v1")
+            .map_err(|_| CarryError::BadKey("master key does not unwrap the data key".into()))?;
+        let arr: [u8; 32] = pt.try_into().map_err(|_| CarryError::Invalid("bad data key length".into()))?;
+        Ok(Self::from_raw(arr))
+    }
+    /// Unwrap with whichever record matches `mk`.
+    pub fn unwrap_any(ws: &[WrappedKey], mk: &MasterKey) -> Result<Self> {
+        match ws.iter().find(|w| w.kid == mk.key_id()) {
+            Some(w) => Self::unwrap(w, mk),
+            None => Err(CarryError::BadKey("master key does not match this repository".into())),
+        }
+    }
+    fn cipher(&self) -> XChaCha20Poly1305 {
+        XChaCha20Poly1305::new((&self.key).into())
+    }
+}
+
+fn seal_raw(c: &XChaCha20Poly1305, pt: &[u8], aad: &[u8]) -> Vec<u8> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let ct = c
+        .encrypt(XNonce::from_slice(&nonce), chacha20poly1305::aead::Payload { msg: pt, aad })
+        .expect("xchacha encrypt cannot fail");
+    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    out
+}
+
+fn open_raw(c: &XChaCha20Poly1305, data: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < NONCE_LEN + 16 {
+        return Err(CarryError::Invalid("ciphertext too short".into()));
+    }
+    let (n, ct) = data.split_at(NONCE_LEN);
+    c.decrypt(XNonce::from_slice(n), chacha20poly1305::aead::Payload { msg: ct, aad })
+        .map_err(|_| CarryError::Invalid("authentication tag mismatch".into()))
+}
+
+/// Encryption mode of a repository, chosen by its `config`.
+#[derive(Debug, Clone)]
+pub enum Cipher {
+    Encrypted(DataKey),
+    /// `--no-encryption`: identity seal, plain BLAKE3 ids. Testing only.
+    None,
+}
+
+impl Cipher {
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, Cipher::Encrypted(_))
+    }
+    /// nonce || ciphertext (identity for None).
+    pub fn seal(&self, pt: &[u8]) -> Vec<u8> {
+        match self {
+            Cipher::Encrypted(k) => seal(k, pt),
+            Cipher::None => pt.to_vec(),
+        }
+    }
+    pub fn open(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            Cipher::Encrypted(k) => open(k, data),
+            Cipher::None => Ok(data.to_vec()),
+        }
+    }
+    pub fn compress_seal(&self, pt: &[u8]) -> Result<Vec<u8>> {
+        Ok(self.seal(&compress(pt)?))
+    }
+    pub fn open_decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
+        decompress(&self.open(data)?)
+    }
+    pub fn blob_id(&self, pt: &[u8]) -> String {
+        match self {
+            Cipher::Encrypted(k) => blob_id(k, pt),
+            Cipher::None => blake3::hash(pt).to_hex().to_string(),
+        }
+    }
+}
+
+pub fn seal(k: &DataKey, pt: &[u8]) -> Vec<u8> {
+    seal_raw(&k.cipher(), pt, b"")
+}
+
+/// Fails with `CarryError::Invalid` on a tag mismatch.
+pub fn open(k: &DataKey, data: &[u8]) -> Result<Vec<u8>> {
+    open_raw(&k.cipher(), data, b"")
+}
+
+pub fn compress(pt: &[u8]) -> Result<Vec<u8>> {
+    zstd::encode_all(pt, ZSTD_LEVEL).map_err(|e| CarryError::Internal(anyhow::anyhow!("zstd: {e}")))
+}
+
+pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    zstd::decode_all(data).map_err(|e| CarryError::Invalid(format!("zstd: {e}")))
+}
+
+pub fn compress_seal(k: &DataKey, pt: &[u8]) -> Result<Vec<u8>> {
+    Ok(seal(k, &compress(pt)?))
+}
+
+pub fn open_decompress(k: &DataKey, data: &[u8]) -> Result<Vec<u8>> {
+    decompress(&open(k, data)?)
+}
+
+/// Hex keyed BLAKE3; key = HKDF-SHA256(data key, "carry blob id").
+pub fn blob_id(k: &DataKey, pt: &[u8]) -> String {
+    blake3::keyed_hash(&k.id_key, pt).to_hex().to_string()
+}
+
+// ---- Ed25519 ----
+
+/// Returns (secret key base64 [32-byte seed], public key base64).
+pub fn ed25519_keygen() -> (String, String) {
+    let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    (B64.encode(sk.to_bytes()), B64.encode(sk.verifying_key().to_bytes()))
+}
+
+pub fn ed25519_public(secret_b64: &str) -> Result<String> {
+    Ok(B64.encode(signing_key(secret_b64)?.verifying_key().to_bytes()))
+}
+
+fn signing_key(secret_b64: &str) -> Result<ed25519_dalek::SigningKey> {
+    let raw = B64.decode(secret_b64.trim()).map_err(|_| CarryError::BadKey("signing key not base64".into()))?;
+    let arr: [u8; 32] = raw.try_into().map_err(|_| CarryError::BadKey("signing key must be 32 bytes".into()))?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
+}
+
+/// base64 signature.
+pub fn sign(secret_b64: &str, msg: &[u8]) -> Result<String> {
+    use ed25519_dalek::Signer;
+    Ok(B64.encode(signing_key(secret_b64)?.sign(msg).to_bytes()))
+}
+
+/// Err(Invalid) if the signature does not verify.
+pub fn verify(public_b64: &str, msg: &[u8], sig_b64: &str) -> Result<()> {
+    use ed25519_dalek::Verifier;
+    let pk = B64.decode(public_b64.trim()).map_err(|_| CarryError::Invalid("public key not base64".into()))?;
+    let pk: [u8; 32] = pk.try_into().map_err(|_| CarryError::Invalid("public key must be 32 bytes".into()))?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).map_err(|_| CarryError::Invalid("bad public key".into()))?;
+    let sig = B64.decode(sig_b64.trim()).map_err(|_| CarryError::Invalid("signature not base64".into()))?;
+    let sig = ed25519_dalek::Signature::from_slice(&sig).map_err(|_| CarryError::Invalid("bad signature".into()))?;
+    vk.verify(msg, &sig).map_err(|_| CarryError::Invalid("signature does not verify".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip() {
+        let dk = DataKey::generate();
+        let ct = compress_seal(&dk, b"hello world").unwrap();
+        assert_eq!(open_decompress(&dk, &ct).unwrap(), b"hello world");
+        assert_eq!(blob_id(&dk, b"x"), blob_id(&dk, b"x"));
+        assert_ne!(blob_id(&dk, b"x"), blob_id(&DataKey::generate(), b"x"));
+    }
+
+    #[test]
+    fn wrap_and_wrong_key() {
+        let mk = MasterKey::generate();
+        let mk2 = MasterKey::from_base64(&mk.to_base64()).unwrap();
+        let dk = DataKey::generate();
+        let w = dk.wrap(&mk);
+        let back = DataKey::unwrap(&w, &mk2).unwrap();
+        assert_eq!(blob_id(&dk, b"a"), blob_id(&back, b"a"));
+        let other = MasterKey::generate();
+        assert!(matches!(DataKey::unwrap(&w, &other), Err(CarryError::BadKey(_))));
+        // forged kid still fails at the AEAD layer
+        let mut forged = w.clone();
+        forged.kid = other.key_id();
+        assert!(matches!(DataKey::unwrap(&forged, &other), Err(CarryError::BadKey(_))));
+    }
+
+    #[test]
+    fn tamper() {
+        let dk = DataKey::generate();
+        let mut ct = seal(&dk, b"secret");
+        let last = ct.len() - 1;
+        ct[last] ^= 1;
+        assert!(matches!(open(&dk, &ct), Err(CarryError::Invalid(_))));
+        assert!(matches!(open(&DataKey::generate(), &seal(&dk, b"s")), Err(CarryError::Invalid(_))));
+    }
+
+    #[test]
+    fn no_encryption_mode() {
+        let c = Cipher::None;
+        assert_eq!(c.seal(b"abc"), b"abc");
+        assert_eq!(c.blob_id(b"abc"), blake3::hash(b"abc").to_hex().to_string());
+    }
+
+    #[test]
+    fn signatures() {
+        let (sk, pk) = ed25519_keygen();
+        assert_eq!(ed25519_public(&sk).unwrap(), pk);
+        let s = sign(&sk, b"m").unwrap();
+        verify(&pk, b"m", &s).unwrap();
+        assert!(verify(&pk, b"n", &s).is_err());
+    }
+}

@@ -1,2 +1,563 @@
+//! Repository: config, blobs, manifests, HEAD, lease, tool-store helpers (ADR 0003/0004/0007).
 //! See openspec/changes/carry-v0-1/design.md for this module's surface.
-#![allow(dead_code, unused)]
+#![allow(dead_code)]
+
+use crate::crypto::{Cipher, DataKey, MasterKey, WrappedKey};
+use crate::error::{CarryError, Result};
+use crate::model::{Head, Manifest, FORMAT_VERSION};
+use crate::store::Store;
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+pub const CONFIG_KEY: &str = "config";
+pub const LEASE_TTL_SECS: i64 = 15;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoConfig {
+    pub format: u32,
+    pub encrypted: bool,
+    #[serde(default)]
+    pub cipher: String,
+    #[serde(default)]
+    pub wrapped_keys: Vec<WrappedKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaseRecord {
+    pub holder: String,
+    pub expires: DateTime<Utc>,
+}
+
+/// A held lease. Keep it and pass to renew/release.
+#[derive(Debug, Clone)]
+pub struct Lease {
+    pub state: String,
+    pub holder: String,
+    pub expires: DateTime<Utc>,
+    etag: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ConditionalWriteReport {
+    pub if_none_match: bool,
+    pub if_match: bool,
+    pub detail: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Repo {
+    pub store: Store,
+    pub config: RepoConfig,
+    cipher: Cipher,
+}
+
+fn blob_key(id: &str) -> String {
+    format!("blobs/{}/{}", &id[..2.min(id.len())], id)
+}
+fn tool_blob_key(id: &str) -> String {
+    format!("tools/blobs/{}/{}", &id[..2.min(id.len())], id)
+}
+fn head_key(state: &str) -> String {
+    format!("refs/{state}/HEAD")
+}
+fn lease_key(state: &str) -> String {
+    format!("refs/{state}/lease")
+}
+fn check_state(state: &str) -> Result<()> {
+    let ok = !state.is_empty()
+        && state.len() <= 128
+        && state.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        && !state.starts_with('.');
+    if ok { Ok(()) } else { Err(CarryError::Usage(format!("invalid state name '{state}'"))) }
+}
+fn check_id(id: &str) -> Result<()> {
+    if id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(CarryError::Invalid(format!("malformed object id '{id}'")))
+    }
+}
+fn json_err(e: serde_json::Error) -> CarryError {
+    CarryError::Invalid(format!("json: {e}"))
+}
+
+impl Repo {
+    /// Load `config`, or create it race-safely with If-None-Match.
+    pub async fn open_or_init(
+        store: Store,
+        master_key: Option<MasterKey>,
+        allow_no_encryption: bool,
+    ) -> Result<Repo> {
+        for _ in 0..3 {
+            if let Some(raw) = store.get_opt(CONFIG_KEY).await? {
+                return Self::from_config(store, &raw, master_key.as_ref());
+            }
+            let (cfg, cipher) = match &master_key {
+                Some(mk) => {
+                    let dk = DataKey::generate();
+                    let cfg = RepoConfig {
+                        format: FORMAT_VERSION,
+                        encrypted: true,
+                        cipher: "xchacha20poly1305+zstd".into(),
+                        wrapped_keys: vec![dk.wrap(mk)],
+                    };
+                    (cfg, Cipher::Encrypted(dk))
+                }
+                None if allow_no_encryption => (
+                    RepoConfig { format: FORMAT_VERSION, encrypted: false, cipher: "none+zstd".into(), wrapped_keys: vec![] },
+                    Cipher::None,
+                ),
+                None => {
+                    return Err(CarryError::BadKey(
+                        "no master key: set CARRY_KEY or CARRY_KEY_FILE (or --no-encryption)".into(),
+                    ))
+                }
+            };
+            let body = serde_json::to_vec_pretty(&cfg).map_err(json_err)?;
+            if store.put_if_absent(CONFIG_KEY, Bytes::from(body)).await? {
+                return Ok(Repo { store, config: cfg, cipher });
+            }
+            // Lost the race: loop and load the winner's config.
+        }
+        Err(CarryError::Conflict("could not read or create repository config".into()))
+    }
+
+    /// Open an existing repo only; NotFound if no config.
+    pub async fn open(store: Store, master_key: Option<MasterKey>) -> Result<Repo> {
+        let raw = store
+            .get_opt(CONFIG_KEY)
+            .await?
+            .ok_or_else(|| CarryError::NotFound("repository config (not initialised)".into()))?;
+        Self::from_config(store, &raw, master_key.as_ref())
+    }
+
+    fn from_config(store: Store, raw: &[u8], mk: Option<&MasterKey>) -> Result<Repo> {
+        let config: RepoConfig = serde_json::from_slice(raw).map_err(json_err)?;
+        if config.format > FORMAT_VERSION {
+            return Err(CarryError::Invalid(format!("repository format {} is newer than this carry", config.format)));
+        }
+        let cipher = if config.encrypted {
+            let mk = mk.ok_or_else(|| CarryError::BadKey("repository is encrypted; set CARRY_KEY or CARRY_KEY_FILE".into()))?;
+            Cipher::Encrypted(DataKey::unwrap_any(&config.wrapped_keys, mk)?)
+        } else {
+            Cipher::None
+        };
+        Ok(Repo { store, config, cipher })
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.cipher.is_encrypted()
+    }
+
+    /// Id a blob would get (without uploading).
+    pub fn blob_id(&self, plaintext: &[u8]) -> String {
+        self.cipher.blob_id(plaintext)
+    }
+
+    // ---- blobs ----
+
+    /// Upload unless already present (dedup). Returns the id.
+    pub async fn put_blob(&self, plaintext: &[u8]) -> Result<String> {
+        self.put_blob_at(plaintext, blob_key).await
+    }
+
+    /// Like put_blob, also reporting whether an upload happened.
+    pub async fn put_blob_report(&self, plaintext: &[u8]) -> Result<(String, bool)> {
+        let id = self.cipher.blob_id(plaintext);
+        let key = blob_key(&id);
+        if self.store.exists(&key).await? {
+            return Ok((id, false));
+        }
+        let body = self.cipher.compress_seal(plaintext)?;
+        let uploaded = self.store.put_if_absent(&key, Bytes::from(body)).await?;
+        Ok((id, uploaded))
+    }
+
+    async fn put_blob_at(&self, plaintext: &[u8], keyf: fn(&str) -> String) -> Result<String> {
+        let id = self.cipher.blob_id(plaintext);
+        let key = keyf(&id);
+        if !self.store.exists(&key).await? {
+            let body = self.cipher.compress_seal(plaintext)?;
+            self.store.put_if_absent(&key, Bytes::from(body)).await?;
+        }
+        Ok(id)
+    }
+
+    /// Download, authenticate, decompress and verify the id.
+    pub async fn get_blob(&self, id: &str) -> Result<Bytes> {
+        self.get_blob_at(id, blob_key).await
+    }
+
+    pub async fn blob_exists(&self, id: &str) -> Result<bool> {
+        check_id(id)?;
+        self.store.exists(&blob_key(id)).await
+    }
+
+    async fn get_blob_at(&self, id: &str, keyf: fn(&str) -> String) -> Result<Bytes> {
+        check_id(id)?;
+        let raw = self.store.get(&keyf(id)).await?;
+        let pt = self.cipher.open_decompress(&raw)?;
+        if self.cipher.blob_id(&pt) != id {
+            return Err(CarryError::Invalid(format!("blob {id} content does not match its id")));
+        }
+        Ok(Bytes::from(pt))
+    }
+
+    // ---- manifests & HEAD ----
+
+    pub async fn write_manifest(&self, m: &Manifest) -> Result<String> {
+        let json = serde_json::to_vec(m).map_err(json_err)?;
+        let id = self.cipher.blob_id(&json);
+        let key = format!("manifests/{id}");
+        if !self.store.exists(&key).await? {
+            let body = self.cipher.compress_seal(&json)?;
+            self.store.put_if_absent(&key, Bytes::from(body)).await?;
+        }
+        Ok(id)
+    }
+
+    pub async fn load_manifest(&self, id: &str) -> Result<Manifest> {
+        check_id(id)?;
+        let raw = self.store.get(&format!("manifests/{id}")).await?;
+        let json = self.cipher.open_decompress(&raw)?;
+        if self.cipher.blob_id(&json) != id {
+            return Err(CarryError::Invalid(format!("manifest {id} does not match its id")));
+        }
+        serde_json::from_slice(&json).map_err(json_err)
+    }
+
+    /// Current HEAD and its etag (for `commit`).
+    pub async fn read_head(&self, state: &str) -> Result<Option<(Head, String)>> {
+        check_state(state)?;
+        match self.store.get_with_etag(&head_key(state)).await? {
+            None => Ok(None),
+            Some((b, etag)) => Ok(Some((serde_json::from_slice(&b).map_err(json_err)?, etag))),
+        }
+    }
+
+    /// Write manifest, then move HEAD by CAS. `expected_etag = None` means "state must not exist yet".
+    /// Conflict if someone else moved HEAD.
+    pub async fn commit(&self, state: &str, expected_etag: Option<String>, manifest: &Manifest) -> Result<Head> {
+        check_state(state)?;
+        let id = self.write_manifest(manifest).await?;
+        let head = Head { manifest: id, seq: manifest.seq };
+        let body = Bytes::from(serde_json::to_vec(&head).map_err(json_err)?);
+        match expected_etag {
+            None => {
+                if !self.store.put_if_absent(&head_key(state), body).await? {
+                    return Err(CarryError::Conflict(format!("state '{state}' was created concurrently")));
+                }
+            }
+            Some(etag) => {
+                self.store.put_if_match(&head_key(state), body, &etag).await.map_err(|e| match e {
+                    CarryError::Conflict(_) => CarryError::Conflict(format!("state '{state}' moved concurrently")),
+                    e => e,
+                })?;
+            }
+        }
+        Ok(head)
+    }
+
+    pub async fn list_states(&self) -> Result<Vec<String>> {
+        let mut v: Vec<String> = self
+            .store
+            .list("refs/")
+            .await?
+            .into_iter()
+            .filter_map(|k| k.strip_prefix("refs/").and_then(|r| r.strip_suffix("/HEAD")).map(str::to_string))
+            .collect();
+        v.sort();
+        Ok(v)
+    }
+
+    // ---- lease ----
+
+    /// Take `refs/<state>/lease` for `ttl_secs` (default 15 s). Conflict if another live holder has it.
+    pub async fn acquire_lease(&self, state: &str, holder: &str, ttl_secs: Option<i64>) -> Result<Lease> {
+        check_state(state)?;
+        let key = lease_key(state);
+        let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.unwrap_or(LEASE_TTL_SECS));
+        let body = Bytes::from(serde_json::to_vec(&LeaseRecord { holder: holder.into(), expires }).map_err(json_err)?);
+        match self.store.get_with_etag(&key).await? {
+            None => {
+                if !self.store.put_if_absent(&key, body).await? {
+                    return Err(CarryError::Conflict(format!("lease on '{state}' taken concurrently")));
+                }
+            }
+            Some((b, etag)) => {
+                let cur: LeaseRecord = serde_json::from_slice(&b).map_err(json_err)?;
+                if cur.holder != holder && cur.expires > Utc::now() {
+                    return Err(CarryError::Conflict(format!(
+                        "state '{state}' is leased by {} until {}",
+                        cur.holder, cur.expires
+                    )));
+                }
+                self.store.put_if_match(&key, body, &etag).await?;
+            }
+        }
+        let (_, etag) = self.store.get_with_etag(&key).await?.ok_or_else(|| CarryError::Conflict("lease vanished".into()))?;
+        Ok(Lease { state: state.into(), holder: holder.into(), expires, etag })
+    }
+
+    /// Extend a held lease. Conflict if it was lost.
+    pub async fn renew_lease(&self, lease: &mut Lease, ttl_secs: Option<i64>) -> Result<()> {
+        let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.unwrap_or(LEASE_TTL_SECS));
+        let body = Bytes::from(
+            serde_json::to_vec(&LeaseRecord { holder: lease.holder.clone(), expires }).map_err(json_err)?,
+        );
+        let etag = self.store.put_if_match(&lease_key(&lease.state), body, &lease.etag).await?;
+        lease.etag = if etag.is_empty() {
+            self.store.head(&lease_key(&lease.state)).await?.map(|h| h.1).unwrap_or_default()
+        } else {
+            etag
+        };
+        lease.expires = expires;
+        Ok(())
+    }
+
+    /// Release if still ours (best effort; never deletes someone else's lease).
+    pub async fn release_lease(&self, lease: Lease) -> Result<()> {
+        let key = lease_key(&lease.state);
+        if let Some((b, _)) = self.store.get_with_etag(&key).await? {
+            let cur: LeaseRecord = serde_json::from_slice(&b).map_err(json_err)?;
+            if cur.holder == lease.holder {
+                self.store.delete(&key).await?;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- tool store ----
+
+    /// Encrypted (same data key), deduplicated blob under tools/blobs/.
+    pub async fn put_tool_blob(&self, plaintext: &[u8]) -> Result<String> {
+        self.put_blob_at(plaintext, tool_blob_key).await
+    }
+
+    pub async fn get_tool_blob(&self, id: &str) -> Result<Bytes> {
+        self.get_blob_at(id, tool_blob_key).await
+    }
+
+    /// Plaintext JSON at a `tools/...` key.
+    pub async fn get_tool_json<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let key = tools_key(key)?;
+        match self.store.get_opt(&key).await? {
+            None => Ok(None),
+            Some(b) => serde_json::from_slice(&b).map(Some).map_err(json_err),
+        }
+    }
+
+    pub async fn put_tool_json<T: Serialize>(&self, key: &str, v: &T) -> Result<()> {
+        let key = tools_key(key)?;
+        self.store.put(&key, Bytes::from(serde_json::to_vec_pretty(v).map_err(json_err)?)).await?;
+        Ok(())
+    }
+
+    /// Ok(false) if the key already exists (e.g. an immutable version).
+    pub async fn put_tool_json_if_absent<T: Serialize>(&self, key: &str, v: &T) -> Result<bool> {
+        let key = tools_key(key)?;
+        self.store.put_if_absent(&key, Bytes::from(serde_json::to_vec_pretty(v).map_err(json_err)?)).await
+    }
+}
+
+fn tools_key(key: &str) -> Result<String> {
+    let k = key.trim_start_matches('/');
+    let k = if k.starts_with("tools/") { k.to_string() } else { format!("tools/{k}") };
+    if k.split('/').any(|s| s == ".." || s.is_empty()) {
+        return Err(CarryError::Usage(format!("bad tool key '{key}'")));
+    }
+    Ok(k)
+}
+
+/// Probe whether the store honours If-None-Match and If-Match on PUT.
+pub async fn doctor_conditional_writes(store: &Store) -> Result<ConditionalWriteReport> {
+    let key = format!("doctor/probe-{}", hex::encode(rand::random::<[u8; 8]>()));
+    let mut detail = Vec::new();
+    let mut if_none_match = false;
+    let mut if_match = false;
+    let res: Result<()> = async {
+        if !store.put_if_absent(&key, Bytes::from_static(b"1")).await? {
+            detail.push("fresh If-None-Match put refused".into());
+            return Ok(());
+        }
+        if_none_match = !store.put_if_absent(&key, Bytes::from_static(b"2")).await?;
+        if !if_none_match {
+            detail.push("If-None-Match: * overwrote an existing object".into());
+        }
+        let (_, e1) = store.get_with_etag(&key).await?.ok_or_else(|| CarryError::Invalid("probe vanished".into()))?;
+        let good = store.put_if_match(&key, Bytes::from_static(b"3"), &e1).await;
+        let stale = store.put_if_match(&key, Bytes::from_static(b"4"), &e1).await;
+        if_match = good.is_ok() && matches!(stale, Err(CarryError::Conflict(_)));
+        if !if_match {
+            detail.push(format!("If-Match: matching put ok={}, stale put conflict={}", good.is_ok(), matches!(stale, Err(CarryError::Conflict(_)))));
+        }
+        Ok(())
+    }
+    .await;
+    let _ = store.delete(&key).await;
+    res?;
+    Ok(ConditionalWriteReport { if_none_match, if_match, detail })
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::model::Op;
+    use std::sync::Arc;
+
+    fn mem() -> Store {
+        Store::from_object_store(Arc::new(object_store::memory::InMemory::new()), "r")
+    }
+
+    pub(crate) fn manifest(seq: u64, parent: Option<String>) -> Manifest {
+        Manifest {
+            format: FORMAT_VERSION,
+            parent,
+            seq,
+            op: Op { kind: "init".into(), args: vec![], at: Utc::now(), by: "t".into() },
+            entries: Default::default(),
+            env: Default::default(),
+            apps: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn repo_in_memory() {
+        let s = mem();
+        let mk = MasterKey::generate();
+        let r = Repo::open_or_init(s.clone(), Some(mk.clone()), false).await.unwrap();
+        let id = r.put_blob(b"data").await.unwrap();
+        assert_eq!(r.put_blob_report(b"data").await.unwrap(), (id.clone(), false));
+        assert_eq!(&r.get_blob(&id).await.unwrap()[..], b"data");
+        let h = r.commit("web-1", None, &manifest(1, None)).await.unwrap();
+        assert!(matches!(r.commit("web-1", None, &manifest(1, None)).await, Err(CarryError::Conflict(_))));
+        let (h2, etag) = r.read_head("web-1").await.unwrap().unwrap();
+        assert_eq!(h, h2);
+        r.commit("web-1", Some(etag.clone()), &manifest(2, Some(h.manifest.clone()))).await.unwrap();
+        assert!(matches!(r.commit("web-1", Some(etag), &manifest(2, None)).await, Err(CarryError::Conflict(_))));
+        assert_eq!(r.list_states().await.unwrap(), vec!["web-1"]);
+        assert_eq!(r.load_manifest(&h.manifest).await.unwrap().seq, 1);
+
+        let mut l = r.acquire_lease("web-1", "a", None).await.unwrap();
+        assert!(matches!(r.acquire_lease("web-1", "b", None).await, Err(CarryError::Conflict(_))));
+        r.renew_lease(&mut l, None).await.unwrap();
+        r.release_lease(l).await.unwrap();
+        r.acquire_lease("web-1", "b", None).await.unwrap();
+
+        let t = r.put_tool_blob(b"bin").await.unwrap();
+        assert_eq!(&r.get_tool_blob(&t).await.unwrap()[..], b"bin");
+
+        assert!(matches!(Repo::open(s.clone(), Some(MasterKey::generate())).await, Err(CarryError::BadKey(_))));
+        assert!(matches!(Repo::open(s, None).await, Err(CarryError::BadKey(_))));
+
+        let rep = doctor_conditional_writes(&mem()).await.unwrap();
+        assert!(rep.if_none_match && rep.if_match);
+    }
+
+    #[tokio::test]
+    async fn no_key_needs_flag() {
+        assert!(matches!(Repo::open_or_init(mem(), None, false).await, Err(CarryError::BadKey(_))));
+        let r = Repo::open_or_init(mem(), None, true).await.unwrap();
+        assert!(!r.is_encrypted());
+    }
+}
+
+/// Live tests against MinIO/S3. Skipped unless CARRY_TEST_ENDPOINT is set; credentials come from
+/// CARRY_TEST_ACCESS_KEY / CARRY_TEST_SECRET_KEY, bucket from CARRY_TEST_BUCKET (default "carry-test").
+#[cfg(test)]
+mod minio_tests {
+    use super::tests::manifest;
+    use super::*;
+    use crate::store::StoreConfig;
+
+    fn live(prefix: &str) -> Option<Store> {
+        let endpoint = std::env::var("CARRY_TEST_ENDPOINT").ok()?;
+        let cfg = StoreConfig {
+            bucket: std::env::var("CARRY_TEST_BUCKET").unwrap_or_else(|_| "carry-test".into()),
+            prefix: format!("{prefix}-{}", hex::encode(rand::random::<[u8; 6]>())),
+            endpoint: Some(endpoint),
+            region: Some("us-east-1".into()),
+            access_key: std::env::var("CARRY_TEST_ACCESS_KEY").ok(),
+            secret_key: std::env::var("CARRY_TEST_SECRET_KEY").ok(),
+            allow_http: true,
+        };
+        Some(Store::new(&cfg).unwrap())
+    }
+
+    #[tokio::test]
+    async fn minio_init_race_dedup_cas_tamper_wrongkey() {
+        let Some(s) = live("core") else { return };
+        let rep = doctor_conditional_writes(&s).await.unwrap();
+        println!("conditional writes: {rep:?}");
+        assert!(rep.if_none_match && rep.if_match, "{rep:?}");
+
+        let mk = MasterKey::generate();
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (s, mk) = (s.clone(), mk.clone());
+                tokio::spawn(async move { Repo::open_or_init(s, Some(mk), false).await.unwrap() })
+            })
+            .collect();
+        let mut repos = Vec::new();
+        for t in tasks {
+            repos.push(t.await.unwrap());
+        }
+        let first = repos[0].config.clone();
+        assert!(repos.iter().all(|r| r.config == first));
+        let r = &repos[0];
+        let id = r.put_blob(b"x").await.unwrap();
+        assert!(repos.iter().all(|o| o.blob_id(b"x") == id));
+
+        let (_, uploaded) = repos[1].put_blob_report(b"x").await.unwrap();
+        assert!(!uploaded);
+        assert_eq!(s.list("blobs/").await.unwrap().len(), 1);
+
+        let h = r.commit("web-1", None, &manifest(1, None)).await.unwrap();
+        let (_, etag) = r.read_head("web-1").await.unwrap().unwrap();
+        let (ma, mut mb) = (manifest(2, Some(h.manifest.clone())), manifest(2, Some(h.manifest.clone())));
+        mb.op.by = "other".into();
+        let a = r.commit("web-1", Some(etag.clone()), &ma);
+        let b = repos[1].commit("web-1", Some(etag.clone()), &mb);
+        let (a, b) = tokio::join!(a, b);
+        assert!(a.is_ok() ^ b.is_ok(), "exactly one commit wins: {a:?} {b:?}");
+        assert!(matches!(a.err().or(b.err()), Some(CarryError::Conflict(_))));
+
+        let key = blob_key(&id);
+        let mut raw = s.get(&key).await.unwrap().to_vec();
+        let n = raw.len() - 1;
+        raw[n] ^= 0x55;
+        s.put(&key, Bytes::from(raw)).await.unwrap();
+        assert!(matches!(r.get_blob(&id).await, Err(CarryError::Invalid(_))));
+
+        let before = s.get(CONFIG_KEY).await.unwrap();
+        assert!(matches!(
+            Repo::open_or_init(s.clone(), Some(MasterKey::generate()), false).await,
+            Err(CarryError::BadKey(_))
+        ));
+        assert_eq!(before, s.get(CONFIG_KEY).await.unwrap());
+
+        for k in s.list("").await.unwrap() {
+            s.delete(&k).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn minio_error_mapping() {
+        let Some(_) = live("x") else { return };
+        let cfg = StoreConfig {
+            bucket: "carry-test".into(),
+            endpoint: Some("http://127.0.0.1:1".into()),
+            access_key: Some("a".into()),
+            secret_key: Some("b".into()),
+            allow_http: true,
+            ..Default::default()
+        };
+        let e = Store::new(&cfg).unwrap().get("k").await.unwrap_err();
+        assert_eq!(e.code(), "unreachable", "{e}");
+        let mut cfg2 = cfg.clone();
+        cfg2.endpoint = std::env::var("CARRY_TEST_ENDPOINT").ok();
+        let e = Store::new(&cfg2).unwrap().get("k").await.unwrap_err();
+        assert_eq!(e.code(), "refused", "{e}");
+    }
+}
