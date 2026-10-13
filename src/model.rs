@@ -80,6 +80,14 @@ pub struct ToolMeta {
     #[serde(default)]
     pub yanked: bool,
     pub published_at: chrono::DateTime<chrono::Utc>,
+    /// Monotonic revision; bumped on every rewrite so launchers can refuse replays.
+    /// Omitted when 0 so metadata signed before this field existed still verifies.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seq: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

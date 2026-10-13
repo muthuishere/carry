@@ -68,6 +68,136 @@ pub fn verify_meta(s: &SignedToolMeta, trusted: &str) -> Result<()> {
         .map_err(|_| CarryError::Invalid(format!("{}@{}: bad signature", s.meta.name, s.meta.version)))
 }
 
+/// Signed payload stored at tools/<name>/channels.json.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChannelsDoc {
+    pub name: String,
+    pub seq: u64,
+    pub channels: Channels,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SignedChannels {
+    pub payload: ChannelsDoc,
+    /// base64 Ed25519 signature over serde_json::to_vec(&payload)
+    pub signature: String,
+    pub signer: String,
+}
+
+pub fn sign_channels(payload: ChannelsDoc, secret_b64: &str) -> Result<SignedChannels> {
+    let msg = serde_json::to_vec(&payload).map_err(|e| CarryError::Internal(anyhow!(e)))?;
+    Ok(SignedChannels {
+        signature: crypto::sign(secret_b64, &msg)?,
+        signer: crypto::ed25519_public(secret_b64)?,
+        payload,
+    })
+}
+
+pub fn verify_channels(s: &SignedChannels, trusted: &str) -> Result<()> {
+    let n = &s.payload.name;
+    if s.signer.trim() != trusted.trim() {
+        return Err(CarryError::Invalid(format!("{n} channels are signed by an untrusted key")));
+    }
+    let msg = serde_json::to_vec(&s.payload).map_err(|e| CarryError::Internal(anyhow!(e)))?;
+    crypto::verify(trusted, &msg, &s.signature).map_err(|_| CarryError::Invalid(format!("{n} channels: bad signature")))
+}
+
+/// Parse a channels.json the launcher fetched: must be signed by `pubkey` and be for `name`.
+pub fn check_channels(raw: &Value, name: &str, pubkey: &str) -> std::result::Result<ChannelsDoc, String> {
+    let s: SignedChannels = serde_json::from_value(raw.clone())
+        .map_err(|_| format!("refused: {name} channels.json is unsigned"))?;
+    verify_channels(&s, pubkey).map_err(|e| format!("refused: {e}"))?;
+    if s.payload.name != name {
+        return Err(format!("refused: channels.json is for '{}', not '{name}'", s.payload.name));
+    }
+    Ok(s.payload)
+}
+
+/// Channel map from either a signed doc or a legacy unsigned map (display only).
+fn channels_for_display(v: &Value) -> Channels {
+    serde_json::from_value::<SignedChannels>(v.clone())
+        .map(|s| s.payload.channels)
+        .or_else(|_| serde_json::from_value::<Channels>(v.clone()))
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------- local high-water marks (anti-replay)
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Hwm {
+    #[serde(default)]
+    channels: u64,
+    /// version -> highest seq seen / yanked ever seen
+    #[serde(default)]
+    versions: BTreeMap<String, HwmEntry>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+struct HwmEntry {
+    seq: u64,
+    yanked: bool,
+}
+
+fn hwm_path(root: &Path, name: &str) -> PathBuf {
+    cache_dir(root).join("meta").join(name).join("hwm.json")
+}
+
+fn load_hwm(root: &Path, name: &str) -> Hwm {
+    std::fs::read(hwm_path(root, name))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_hwm(root: &Path, name: &str, h: &Hwm) -> std::result::Result<(), String> {
+    let p = hwm_path(root, name);
+    let dir = p.parent().expect("hwm has parent");
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(".hwm.tmp{}", std::process::id()));
+    let b = serde_json::to_vec(h).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, b).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &p).map_err(|e| format!("{}: {e}", p.display()))
+}
+
+/// Refuse tool metadata older than what this machine already saw; remember yanks forever.
+fn check_meta_hwm(root: &Path, m: &ToolMeta) -> std::result::Result<(), String> {
+    let mut h = load_hwm(root, &m.name);
+    let seen = h.versions.get(&m.version).cloned().unwrap_or_default();
+    if m.seq < seen.seq {
+        return Err(format!(
+            "refused: {}@{} metadata seq {} is older than seq {} already seen (replay?)",
+            m.name, m.version, m.seq, seen.seq
+        ));
+    }
+    if seen.yanked && !m.yanked {
+        return Err(format!("refused: {}@{} is yanked", m.name, m.version));
+    }
+    if m.seq > seen.seq || (m.yanked && !seen.yanked) {
+        h.versions.insert(m.version.clone(), HwmEntry { seq: m.seq, yanked: m.yanked || seen.yanked });
+        save_hwm(root, &m.name, &h)?;
+    }
+    Ok(())
+}
+
+fn locally_yanked(root: &Path, name: &str, version: &str) -> bool {
+    load_hwm(root, name).versions.get(version).is_some_and(|e| e.yanked)
+}
+
+fn check_channels_hwm(root: &Path, c: &ChannelsDoc) -> std::result::Result<(), String> {
+    let mut h = load_hwm(root, &c.name);
+    if c.seq < h.channels {
+        return Err(format!(
+            "refused: {} channels seq {} is older than seq {} already seen (replay?)",
+            c.name, c.seq, h.channels
+        ));
+    }
+    if c.seq > h.channels {
+        h.channels = c.seq;
+        save_hwm(root, &c.name, &h)?;
+    }
+    Ok(())
+}
+
 fn signing_key(s: &Settings) -> Result<String> {
     s.signing_key
         .clone()
@@ -90,8 +220,10 @@ async fn write_json<T: serde::Serialize>(repo: &Repo, key: &str, v: &T, etag: Op
     let b = Bytes::from(serde_json::to_vec_pretty(v).map_err(|e| CarryError::Internal(anyhow!(e)))?);
     match etag {
         None => repo.store.put_if_absent(key, b).await,
-        // Some stores return no etag; fall back to a plain put.
-        Some("") => repo.store.put(key, b).await.map(|_| true),
+        // No ETag means we cannot write conditionally; never fall back to a blind overwrite.
+        Some("") => Err(CarryError::Conflict(format!(
+            "{key}: store returned no ETag; refusing an unconditional overwrite"
+        ))),
         Some(e) => match repo.store.put_if_match(key, b, e).await {
             Ok(_) => Ok(true),
             Err(CarryError::Conflict(_)) => Ok(false),
@@ -154,9 +286,21 @@ pub fn keygen_to(out: &Path) -> Result<Value> {
     Ok(json!({"public_key": public, "private_key_file": out.display().to_string()}))
 }
 
-async fn download(url: &str) -> Result<Vec<u8>> {
+fn http_client(timeout_secs: u64) -> Result<reqwest::Client> {
+    let t = timeout_secs.max(1);
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(t))
+        // Whole transfer (headers + body); generous because tool binaries can be large.
+        .timeout(std::time::Duration::from_secs(t.saturating_mul(20)))
+        .build()
+        .map_err(|e| CarryError::Internal(anyhow!(e)))
+}
+
+async fn download(url: &str, timeout_secs: u64) -> Result<Vec<u8>> {
     use futures::StreamExt;
-    let resp = reqwest::get(url)
+    let resp = http_client(timeout_secs)?
+        .get(url)
+        .send()
         .await
         .map_err(|e| CarryError::Unreachable(format!("{url}: {e}")))?;
     if !resp.status().is_success() {
@@ -192,7 +336,7 @@ pub async fn publish(s: &Settings, name: &str, version: &str, src: ToolSource, p
             (sha, size, blob)
         }
         ToolSource::Url { url, sha256 } => {
-            let b = download(&url).await?;
+            let b = download(&url, s.timeout_secs).await?;
             if let Some(want) = sha256 {
                 let got = sha256_hex(&b);
                 if !got.eq_ignore_ascii_case(want.trim()) {
@@ -212,6 +356,7 @@ pub async fn publish(s: &Settings, name: &str, version: &str, src: ToolSource, p
                 verify_meta(&old, &me)?;
                 let mut m = old.meta;
                 m.platforms.insert(platform.to_string(), build.clone());
+                m.seq += 1;
                 m
             }
             None => ToolMeta {
@@ -220,6 +365,7 @@ pub async fn publish(s: &Settings, name: &str, version: &str, src: ToolSource, p
                 platforms: BTreeMap::from([(platform.to_string(), build.clone())]),
                 yanked: false,
                 published_at: chrono::Utc::now(),
+                seq: 1,
             },
         };
         sign_meta(meta, &sk)
@@ -230,6 +376,8 @@ pub async fn publish(s: &Settings, name: &str, version: &str, src: ToolSource, p
 
 pub async fn promote(s: &Settings, name: &str, version: &str, channel: &str) -> Result<Value> {
     valid_name("channel", channel)?;
+    let sk = signing_key(s)?;
+    let me = crypto::ed25519_public(&sk)?;
     let repo = ctx::open_repo_for_write(s).await?;
     let m: SignedToolMeta = repo
         .get_tool_json(&meta_key(name, version))
@@ -238,10 +386,28 @@ pub async fn promote(s: &Settings, name: &str, version: &str, channel: &str) -> 
     if m.meta.yanked {
         return Err(CarryError::Refused(format!("{name}@{version} is yanked")));
     }
-    rmw::<Channels, _>(&repo, &channels_key(name), |old| {
-        let mut c = old.unwrap_or_default();
-        c.insert(channel.into(), version.into());
-        Ok(c)
+    verify_meta(&m, &me).map_err(|_| CarryError::Refused(format!("{name}@{version} was signed by a different key")))?;
+    rmw::<Value, _>(&repo, &channels_key(name), |old| {
+        let doc = match old {
+            None => ChannelsDoc { name: name.into(), seq: 0, channels: Channels::new() },
+            Some(v) => match serde_json::from_value::<SignedChannels>(v.clone()) {
+                Ok(sc) => {
+                    verify_channels(&sc, &me)
+                        .map_err(|_| CarryError::Refused(format!("{name} channels were signed by a different key")))?;
+                    sc.payload
+                }
+                // Legacy unsigned map: migrate it into a signed doc.
+                Err(_) => ChannelsDoc {
+                    name: name.into(),
+                    seq: 0,
+                    channels: serde_json::from_value(v).map_err(|e| CarryError::Invalid(format!("channels.json: {e}")))?,
+                },
+            },
+        };
+        let mut doc = doc;
+        doc.channels.insert(channel.into(), version.into());
+        doc.seq += 1;
+        serde_json::to_value(sign_channels(doc, &sk)?).map_err(|e| CarryError::Internal(anyhow!(e)))
     })
     .await?;
     Ok(json!({"name": name, "channel": channel, "version": version}))
@@ -256,6 +422,7 @@ pub async fn yank(s: &Settings, name: &str, version: &str) -> Result<Value> {
         verify_meta(&old, &me).map_err(|_| CarryError::Refused(format!("{name}@{version} was signed by a different key")))?;
         let mut m = old.meta;
         m.yanked = true;
+        m.seq += 1;
         sign_meta(m, &sk)
     })
     .await?;
@@ -271,7 +438,11 @@ pub async fn ls(s: &Settings, name: Option<&str>) -> Result<Value> {
     let mut tools = Vec::new();
     for n in names {
         let versions = repo.store.list_dirs(&format!("tools/{n}")).await?;
-        let channels: Channels = repo.get_tool_json(&channels_key(&n)).await?.unwrap_or_default();
+        let channels = repo
+            .get_tool_json::<Value>(&channels_key(&n))
+            .await?
+            .map(|v| channels_for_display(&v))
+            .unwrap_or_default();
         if name.is_some() && versions.is_empty() {
             return Err(CarryError::NotFound(format!("tool '{n}'")));
         }
@@ -393,9 +564,22 @@ pub fn resolve_version(name: &str, r: &ToolRef, channels: Option<&Channels>) -> 
         .map_err(|e| format!("{e} (tool {name})"))
 }
 
-/// Check a fetched tool.json and pick the build for `platform`.
-pub fn select_build(m: &SignedToolMeta, pubkey: &str, platform: &str) -> std::result::Result<ToolBuild, String> {
+/// Check a fetched tool.json is for `name@version`, trusted, not yanked, and pick the
+/// build for `platform`. A validly signed tool.json for another tool/version is refused.
+pub fn select_build(
+    m: &SignedToolMeta,
+    pubkey: &str,
+    name: &str,
+    version: &str,
+    platform: &str,
+) -> std::result::Result<ToolBuild, String> {
     verify_meta(m, pubkey).map_err(|e| format!("refused: {e}"))?;
+    if m.meta.name != name || m.meta.version != version {
+        return Err(format!(
+            "refused: metadata is for {}@{}, not {name}@{version}",
+            m.meta.name, m.meta.version
+        ));
+    }
     if m.meta.yanked {
         return Err(format!("{}@{} is yanked", m.meta.name, m.meta.version));
     }
@@ -426,21 +610,25 @@ pub fn launch_from_argv0(name: &str) -> i32 {
     }
 }
 
+fn launcher_pubkey(s: Option<&Settings>) -> std::result::Result<String, String> {
+    s.and_then(|s| s.tool_pubkey.clone())
+        .or_else(|| std::env::var("CARRY_TOOL_PUBKEY").ok())
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "refused: CARRY_TOOL_PUBKEY is not set".to_string())
+}
+
 fn prepare(name: &str) -> std::result::Result<PathBuf, String> {
     let root = std::env::var("CARRY_ROOT").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/carry"));
     let apps = read_apps(&root)?;
     let r = apps.get(name).ok_or_else(|| "not listed in this state's apps".to_string())?;
-    let pubkey = std::env::var("CARRY_TOOL_PUBKEY")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| "refused: CARRY_TOOL_PUBKEY is not set".to_string())?;
+    let pubkey = launcher_pubkey(None)?;
     let platform = current_platform();
     let meta_cache = cache_dir(&root).join("meta").join(name);
 
     // Fast path: pinned version with verified metadata and binary already cached.
     if let Some(v) = &r.version {
         let mf = meta_cache.join(format!("{v}.json"));
-        if let Some(bin) = cached_binary(&root, &mf, &pubkey, &platform) {
+        if let Some(bin) = cached_binary(&root, &mf, &pubkey, name, v, &platform) {
             // Best effort: honour a yank if the store answers within 1 s; offline -> run cached.
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
             if let Ok(rt) = rt {
@@ -451,23 +639,29 @@ fn prepare(name: &str) -> std::result::Result<PathBuf, String> {
                 };
                 let fresh = rt.block_on(yank_check(fetch_meta, &pubkey, YANK_CHECK_BUDGET));
                 rt.shutdown_background();
-                if let Some(m) = fresh.filter(|m| m.meta.yanked) {
-                    // Persist so later offline launches refuse too.
-                    if let Ok(b) = serde_json::to_vec(&m) {
-                        let _ = std::fs::write(&mf, b);
+                if let Some(m) = fresh.filter(|m| m.meta.name == *name && m.meta.version == *v) {
+                    // Records a yank (sticky) and refuses replays of older metadata.
+                    check_meta_hwm(&root, &m.meta)?;
+                    if m.meta.yanked {
+                        if let Ok(b) = serde_json::to_vec(&m) {
+                            let _ = std::fs::write(&mf, b);
+                        }
+                        return Err(format!("refused: {name}@{v} is yanked"));
                     }
-                    return Err(format!("refused: {name}@{v} is yanked"));
                 }
             }
             return Ok(bin);
         }
     }
 
+    let s = Settings::resolve(&crate::cli::GlobalArgs::default()).map_err(|e| e.to_string())?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
-    rt.block_on(fetch(name, r, &root, &pubkey, &platform, &meta_cache))
+    let out = rt.block_on(fetch_bounded(&s, name, r, &root, &pubkey, &platform));
+    rt.shutdown_background();
+    out
 }
 
 const YANK_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
@@ -483,28 +677,85 @@ where
     Some(m)
 }
 
-fn cached_binary(root: &Path, meta_file: &Path, pubkey: &str, platform: &str) -> Option<PathBuf> {
+fn cached_binary(
+    root: &Path,
+    meta_file: &Path,
+    pubkey: &str,
+    name: &str,
+    version: &str,
+    platform: &str,
+) -> Option<PathBuf> {
+    if locally_yanked(root, name, version) {
+        return None;
+    }
     let b = std::fs::read(meta_file).ok()?;
     let m: SignedToolMeta = serde_json::from_slice(&b).ok()?;
-    let build = select_build(&m, pubkey, platform).ok()?;
+    let build = select_build(&m, pubkey, name, version, platform).ok()?;
     let bin = cache_dir(root).join(&build.sha256);
     bin.is_file().then_some(bin)
 }
 
-async fn fetch(
+/// `fetch` bounded by CARRY_TIMEOUT (settings.timeout_secs) end to end, lock wait included.
+async fn fetch_bounded(
+    s: &Settings,
     name: &str,
     r: &ToolRef,
     root: &Path,
     pubkey: &str,
     platform: &str,
-    meta_cache: &Path,
 ) -> std::result::Result<PathBuf, String> {
-    let s = Settings::resolve(&crate::cli::GlobalArgs::default()).map_err(|e| e.to_string())?;
-    let repo = ctx::open_repo(&s).await.map_err(|e| e.to_string())?;
+    let secs = s.timeout_secs.max(1);
+    let work = async {
+        let repo = ctx::open_repo(s).await.map_err(|e| e.to_string())?;
+        fetch_with_repo(&repo, name, r, root, pubkey, platform).await
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), work).await {
+        Ok(x) => x,
+        Err(_) => Err(format!("timed out after {secs}s fetching from the tool store (CARRY_TIMEOUT)")),
+    }
+}
+
+/// Take the per-tool flock, polling a non-blocking try-lock so the caller's timeout can cancel it.
+async fn lock_polling(path: &Path) -> std::result::Result<nix::fcntl::Flock<std::fs::File>, String> {
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| format!("lock: {e}"))?;
+    loop {
+        match nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(l) => return Ok(l),
+            Err((back, nix::errno::Errno::EWOULDBLOCK)) => {
+                f = back;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err((_, e)) => return Err(format!("lock: {e}")),
+        }
+    }
+}
+
+async fn fetch_with_repo(
+    repo: &Repo,
+    name: &str,
+    r: &ToolRef,
+    root: &Path,
+    pubkey: &str,
+    platform: &str,
+) -> std::result::Result<PathBuf, String> {
+    let meta_cache = cache_dir(root).join("meta").join(name);
     let version = if r.version.is_some() {
         resolve_version(name, r, None)?
     } else {
-        let ch: Option<Channels> = repo.get_tool_json(&channels_key(name)).await.map_err(|e| e.to_string())?;
+        let raw: Option<Value> = repo.get_tool_json(&channels_key(name)).await.map_err(|e| e.to_string())?;
+        let ch = match raw {
+            None => None,
+            Some(v) => {
+                let doc = check_channels(&v, name, pubkey)?;
+                check_channels_hwm(root, &doc)?;
+                Some(doc.channels)
+            }
+        };
         resolve_version(name, r, ch.as_ref())?
     };
     let m: SignedToolMeta = repo
@@ -512,24 +763,23 @@ async fn fetch(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("{name}@{version} not found in the tool store"))?;
-    let build = select_build(&m, pubkey, platform)?;
+    // Identity + signature first, then anti-replay bookkeeping, then yank/platform.
+    verify_meta(&m, pubkey).map_err(|e| format!("refused: {e}"))?;
+    if m.meta.name != name || m.meta.version != version {
+        return Err(format!("refused: metadata is for {}@{}, not {name}@{version}", m.meta.name, m.meta.version));
+    }
+    check_meta_hwm(root, &m.meta)?;
+    let build = select_build(&m, pubkey, name, &version, platform)?;
     let dir = cache_dir(root);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let bin = dir.join(&build.sha256);
 
     // One downloader per tool; others wait, then find the binary present.
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(dir.join(format!(".lock-{name}")))
-        .map_err(|e| format!("lock: {e}"))?;
-    let _lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive)
-        .map_err(|(_, e)| format!("lock: {e}"))?;
+    let _lock = lock_polling(&dir.join(format!(".lock-{name}"))).await?;
 
     if !bin.is_file() {
         let tmp = dir.join(format!(".{}.tmp{}", build.sha256, std::process::id()));
-        let got = download_blob(&repo, &build.blob, &tmp).await;
+        let got = download_blob(repo, &build.blob, &tmp).await;
         let got = match got {
             Ok(g) => g,
             Err(e) => {
@@ -546,7 +796,7 @@ async fn fetch(
         std::fs::rename(&tmp, &bin).map_err(|e| format!("cache rename: {e}"))?;
     }
     // Remember verified metadata so later pinned launches need no network.
-    if std::fs::create_dir_all(meta_cache).is_ok() {
+    if std::fs::create_dir_all(&meta_cache).is_ok() {
         if let Ok(b) = serde_json::to_vec(&m) {
             let f = meta_cache.join(format!("{version}.json"));
             let tmp = meta_cache.join(format!(".{version}.tmp{}", std::process::id()));
@@ -556,6 +806,101 @@ async fn fetch(
         }
     }
     Ok(bin)
+}
+
+// ---------------------------------------------------------------- prefetch
+
+/// Download + verify tools into `<root>/cache/tools` without exec'ing them, using the
+/// launcher's fetch path (signature, identity, anti-replay, sha256, timeout). Selects
+/// tools with `required` (when `only_required`) or `prefetch || required` otherwise.
+/// Records each result in `<root>/cache/tools/status.json` as
+/// `{"<name>": {"status": "ready"|"failed", "reason"?: "...", "at": "..."}}`.
+pub async fn prefetch_tools(
+    settings: &Settings,
+    root: &Path,
+    apps: &BTreeMap<String, ToolRef>,
+    only_required: bool,
+) -> Vec<(String, std::result::Result<(), String>)> {
+    let picked: Vec<(&String, &ToolRef)> = apps
+        .iter()
+        .filter(|(_, r)| if only_required { r.required } else { r.prefetch || r.required })
+        .collect();
+    if picked.is_empty() {
+        return Vec::new();
+    }
+    let platform = current_platform();
+    let mut out = Vec::new();
+    match launcher_pubkey(Some(settings)) {
+        Err(e) => {
+            for (n, _) in picked {
+                out.push((n.clone(), Err(e.clone())));
+            }
+        }
+        Ok(pk) => {
+            for (n, r) in picked {
+                let res = if valid_name("tool name", n).is_err() {
+                    Err(format!("bad tool name '{n}'"))
+                } else {
+                    fetch_bounded(settings, n, r, root, &pk, &platform).await.map(|_| ())
+                };
+                out.push((n.clone(), res));
+            }
+        }
+    }
+    record_status(root, &out);
+    out
+}
+
+/// Prefetch with an already-open repo (tests).
+async fn prefetch_with_repo(
+    repo: &Repo,
+    root: &Path,
+    apps: &BTreeMap<String, ToolRef>,
+    pubkey: &str,
+) -> Vec<(String, std::result::Result<(), String>)> {
+    let platform = current_platform();
+    let mut out = Vec::new();
+    for (n, r) in apps.iter().filter(|(_, r)| r.prefetch || r.required) {
+        let res = fetch_with_repo(repo, n, r, root, pubkey, &platform).await.map(|_| ());
+        out.push((n.clone(), res));
+    }
+    record_status(root, &out);
+    out
+}
+
+pub fn status_path(root: &Path) -> PathBuf {
+    cache_dir(root).join("status.json")
+}
+
+/// Per-tool status recorded by the last prefetch: name -> {"status", "reason"?}.
+pub fn read_status(root: &Path) -> BTreeMap<String, Value> {
+    std::fs::read(status_path(root))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn record_status(root: &Path, results: &[(String, std::result::Result<(), String>)]) {
+    let mut st = read_status(root);
+    let at = chrono::Utc::now().to_rfc3339();
+    for (n, r) in results {
+        let v = match r {
+            Ok(()) => json!({"status": "ready", "at": at}),
+            Err(e) => json!({"status": "failed", "reason": e, "at": at}),
+        };
+        st.insert(n.clone(), v);
+    }
+    let p = status_path(root);
+    let Some(dir) = p.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = dir.join(format!(".status.tmp{}", std::process::id()));
+    if let Ok(b) = serde_json::to_vec_pretty(&st) {
+        if std::fs::write(&tmp, b).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
+        }
+    }
 }
 
 struct ShaSink<'a>(&'a mut Sha256);
@@ -612,6 +957,7 @@ mod tests {
             )]),
             yanked,
             published_at: chrono::Utc::now(),
+            seq: 1,
         }
     }
 
@@ -638,20 +984,20 @@ mod tests {
         let (sk, pk) = crypto::ed25519_keygen();
         let mut s = sign_meta(meta(false), &sk).unwrap();
         s.signature = String::new();
-        assert!(select_build(&s, &pk, "linux/amd64").unwrap_err().starts_with("refused"));
+        assert!(select_build(&s, &pk, "jq", "1.7", "linux/amd64").unwrap_err().starts_with("refused"));
         let (sk2, _) = crypto::ed25519_keygen();
         let foreign = sign_meta(meta(false), &sk2).unwrap();
-        assert!(select_build(&foreign, &pk, "linux/amd64").unwrap_err().starts_with("refused"));
+        assert!(select_build(&foreign, &pk, "jq", "1.7", "linux/amd64").unwrap_err().starts_with("refused"));
     }
 
     #[test]
     fn yank_and_channels() {
         let (sk, pk) = crypto::ed25519_keygen();
         let ok = sign_meta(meta(false), &sk).unwrap();
-        assert_eq!(select_build(&ok, &pk, "linux/amd64").unwrap().sha256, "ab");
-        assert!(select_build(&ok, &pk, "linux/arm64").unwrap_err().contains("no build"));
+        assert_eq!(select_build(&ok, &pk, "jq", "1.7", "linux/amd64").unwrap().sha256, "ab");
+        assert!(select_build(&ok, &pk, "jq", "1.7", "linux/arm64").unwrap_err().contains("no build"));
         let y = sign_meta(meta(true), &sk).unwrap();
-        assert!(select_build(&y, &pk, "linux/amd64").unwrap_err().contains("yanked"));
+        assert!(select_build(&y, &pk, "jq", "1.7", "linux/amd64").unwrap_err().contains("yanked"));
 
         let ch = Channels::from([("stable".into(), "1.7".into())]);
         let pinned = ToolRef { version: Some("1.6".into()), ..Default::default() };
@@ -696,11 +1042,11 @@ mod tests {
         let mf = d.path().join("cache/tools/meta/jq/1.7.json");
         std::fs::create_dir_all(mf.parent().unwrap()).unwrap();
         std::fs::write(&mf, serde_json::to_vec(&s).unwrap()).unwrap();
-        assert!(cached_binary(d.path(), &mf, &pk, &plat).is_none());
+        assert!(cached_binary(d.path(), &mf, &pk, "jq", "1.7", &plat).is_none());
         std::fs::write(d.path().join("cache/tools").join(&sha), body).unwrap();
-        assert_eq!(cached_binary(d.path(), &mf, &pk, &plat).unwrap(), d.path().join("cache/tools").join(&sha));
+        assert_eq!(cached_binary(d.path(), &mf, &pk, "jq", "1.7", &plat).unwrap(), d.path().join("cache/tools").join(&sha));
         let (_, other) = crypto::ed25519_keygen();
-        assert!(cached_binary(d.path(), &mf, &other, &plat).is_none());
+        assert!(cached_binary(d.path(), &mf, &other, "jq", "1.7", &plat).is_none());
     }
 
     #[test]
@@ -741,5 +1087,186 @@ mod tests {
         std::fs::write(d.path().join("current/manifest.json"), r#"{"apps":{"jq":{"version":"1.7"}}}"#).unwrap();
         let a = read_apps(d.path()).unwrap();
         assert_eq!(a["jq"].version.as_deref(), Some("1.7"));
+    }
+
+    async fn mem_repo() -> Repo {
+        let st = crate::store::Store::from_object_store(std::sync::Arc::new(object_store::memory::InMemory::new()), "r");
+        Repo::open_or_init(st, None, true).await.unwrap()
+    }
+
+    async fn put_json<T: serde::Serialize>(repo: &Repo, key: &str, v: &T) {
+        repo.store.put(key, Bytes::from(serde_json::to_vec(v).unwrap())).await.unwrap();
+    }
+
+    /// Publish `body` as name@version for this platform into an in-memory repo.
+    async fn publish_mem(repo: &Repo, sk: &str, name: &str, version: &str, body: &[u8], seq: u64, yanked: bool) {
+        let blob = repo.put_tool_blob(body).await.unwrap();
+        let m = ToolMeta {
+            name: name.into(),
+            version: version.into(),
+            platforms: BTreeMap::from([(
+                current_platform(),
+                ToolBuild { sha256: sha256_hex(body), size: body.len() as u64, blob },
+            )]),
+            yanked,
+            published_at: chrono::Utc::now(),
+            seq,
+        };
+        put_json(repo, &meta_key(name, version), &sign_meta(m, sk).unwrap()).await;
+    }
+
+    #[test]
+    fn identity_mismatch_refused() {
+        let (sk, pk) = crypto::ed25519_keygen();
+        let s = sign_meta(meta(false), &sk).unwrap(); // jq@1.7, validly signed
+        assert!(select_build(&s, &pk, "yq", "1.7", "linux/amd64").unwrap_err().contains("not yq@1.7"));
+        assert!(select_build(&s, &pk, "jq", "1.6", "linux/amd64").unwrap_err().contains("not jq@1.6"));
+    }
+
+    #[test]
+    fn legacy_meta_without_seq_still_verifies() {
+        let (sk, pk) = crypto::ed25519_keygen();
+        let mut m = meta(false);
+        m.seq = 0;
+        let s = sign_meta(m, &sk).unwrap();
+        let txt = serde_json::to_string(&s).unwrap();
+        assert!(!txt.contains("\"seq\""));
+        let back: SignedToolMeta = serde_json::from_str(&txt).unwrap();
+        verify_meta(&back, &pk).unwrap();
+    }
+
+    #[test]
+    fn meta_replay_and_sticky_yank() {
+        let d = tempfile::tempdir().unwrap();
+        let mut m = meta(false);
+        m.seq = 3;
+        check_meta_hwm(d.path(), &m).unwrap();
+        m.seq = 2; // downgrade/replay of older metadata
+        assert!(check_meta_hwm(d.path(), &m).unwrap_err().contains("replay"));
+        m.seq = 4;
+        m.yanked = true;
+        check_meta_hwm(d.path(), &m).unwrap();
+        assert!(locally_yanked(d.path(), "jq", "1.7"));
+        // Un-yank with a higher seq is still refused: the yank is sticky locally.
+        m.seq = 9;
+        m.yanked = false;
+        assert!(check_meta_hwm(d.path(), &m).unwrap_err().contains("yanked"));
+        // Another version is unaffected.
+        m.version = "1.8".into();
+        check_meta_hwm(d.path(), &m).unwrap();
+    }
+
+    #[test]
+    fn channels_must_be_signed_for_this_tool_and_fresh() {
+        let d = tempfile::tempdir().unwrap();
+        let (sk, pk) = crypto::ed25519_keygen();
+        let doc = |name: &str, seq| ChannelsDoc {
+            name: name.into(),
+            seq,
+            channels: Channels::from([("stable".into(), "1.7".into())]),
+        };
+        let good = serde_json::to_value(sign_channels(doc("jq", 2), &sk).unwrap()).unwrap();
+        assert_eq!(check_channels(&good, "jq", &pk).unwrap().channels["stable"], "1.7");
+        // Legacy unsigned map.
+        let unsigned = json!({"stable": "1.7"});
+        assert!(check_channels(&unsigned, "jq", &pk).unwrap_err().contains("unsigned"));
+        // Foreign signer.
+        let (sk2, _) = crypto::ed25519_keygen();
+        let foreign = serde_json::to_value(sign_channels(doc("jq", 2), &sk2).unwrap()).unwrap();
+        assert!(check_channels(&foreign, "jq", &pk).unwrap_err().starts_with("refused"));
+        // Signed for another tool.
+        let other = serde_json::to_value(sign_channels(doc("yq", 2), &sk).unwrap()).unwrap();
+        assert!(check_channels(&other, "jq", &pk).unwrap_err().contains("not 'jq'"));
+        // Tampered payload.
+        let mut t = good.clone();
+        t["payload"]["channels"]["stable"] = json!("0.1");
+        assert!(check_channels(&t, "jq", &pk).is_err());
+        // Replay of older channels.
+        check_channels_hwm(d.path(), &doc("jq", 2)).unwrap();
+        assert!(check_channels_hwm(d.path(), &doc("jq", 1)).unwrap_err().contains("replay"));
+        check_channels_hwm(d.path(), &doc("jq", 2)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_etag_is_a_conflict_not_a_blind_put() {
+        let repo = mem_repo().await;
+        put_json(&repo, "tools/jq/channels.json", &json!({"a": 1})).await;
+        let e = write_json(&repo, "tools/jq/channels.json", &json!({"b": 2}), Some("")).await.unwrap_err();
+        assert!(matches!(e, CarryError::Conflict(_)));
+        let (v, _) = read_json::<Value>(&repo, "tools/jq/channels.json").await.unwrap().unwrap();
+        assert_eq!(v, json!({"a": 1}));
+    }
+
+    #[tokio::test]
+    async fn lock_wait_is_cancellable() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(".lock-jq");
+        let held = lock_polling(&p).await.unwrap();
+        let t = std::time::Instant::now();
+        let r = tokio::time::timeout(std::time::Duration::from_millis(300), lock_polling(&p)).await;
+        assert!(r.is_err(), "second locker must still be waiting");
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        drop(held);
+        lock_polling(&p).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_swapped_meta_and_unsigned_channels() {
+        let repo = mem_repo().await;
+        let d = tempfile::tempdir().unwrap();
+        let (sk, pk) = crypto::ed25519_keygen();
+        let plat = current_platform();
+        publish_mem(&repo, &sk, "evil", "1.0", b"#!/bin/sh\necho evil\n", 1, false).await;
+        // Copy evil's signed tool.json to jq@1.0.
+        let evil: SignedToolMeta = repo.get_tool_json(&meta_key("evil", "1.0")).await.unwrap().unwrap();
+        put_json(&repo, &meta_key("jq", "1.0"), &evil).await;
+        let pinned = ToolRef { version: Some("1.0".into()), ..Default::default() };
+        let e = fetch_with_repo(&repo, "jq", &pinned, d.path(), &pk, &plat).await.unwrap_err();
+        assert!(e.contains("not jq@1.0"), "{e}");
+        // Unsigned channels.json is refused for channel lookups.
+        put_json(&repo, &channels_key("jq"), &json!({"stable": "1.0"})).await;
+        let e = fetch_with_repo(&repo, "jq", &ToolRef::default(), d.path(), &pk, &plat).await.unwrap_err();
+        assert!(e.contains("unsigned"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_replayed_unyank() {
+        let repo = mem_repo().await;
+        let d = tempfile::tempdir().unwrap();
+        let (sk, pk) = crypto::ed25519_keygen();
+        let plat = current_platform();
+        let pinned = ToolRef { version: Some("1.0".into()), ..Default::default() };
+        publish_mem(&repo, &sk, "jq", "1.0", b"v1", 1, false).await;
+        let old: SignedToolMeta = repo.get_tool_json(&meta_key("jq", "1.0")).await.unwrap().unwrap();
+        fetch_with_repo(&repo, "jq", &pinned, d.path(), &pk, &plat).await.unwrap();
+        publish_mem(&repo, &sk, "jq", "1.0", b"v1", 2, true).await;
+        assert!(fetch_with_repo(&repo, "jq", &pinned, d.path(), &pk, &plat).await.unwrap_err().contains("yanked"));
+        // Attacker restores the old, validly signed, un-yanked tool.json.
+        put_json(&repo, &meta_key("jq", "1.0"), &old).await;
+        let e = fetch_with_repo(&repo, "jq", &pinned, d.path(), &pk, &plat).await.unwrap_err();
+        assert!(e.contains("replay") || e.contains("yanked"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn prefetch_records_status() {
+        let repo = mem_repo().await;
+        let d = tempfile::tempdir().unwrap();
+        let (sk, pk) = crypto::ed25519_keygen();
+        publish_mem(&repo, &sk, "jq", "1.7", b"jq-binary", 1, false).await;
+        let chans = ChannelsDoc { name: "jq".into(), seq: 1, channels: Channels::from([("stable".into(), "1.7".into())]) };
+        put_json(&repo, &channels_key("jq"), &sign_channels(chans, &sk).unwrap()).await;
+        let apps = BTreeMap::from([
+            ("jq".to_string(), ToolRef { prefetch: true, ..Default::default() }),
+            ("yq".to_string(), ToolRef { version: Some("4".into()), required: true, ..Default::default() }),
+            ("lazy".to_string(), ToolRef::default()),
+        ]);
+        let res = prefetch_with_repo(&repo, d.path(), &apps, &pk).await;
+        assert_eq!(res.len(), 2, "tools without prefetch/required are skipped");
+        let st = read_status(d.path());
+        assert_eq!(st["jq"]["status"], "ready");
+        assert_eq!(st["yq"]["status"], "failed");
+        assert!(st["yq"]["reason"].as_str().unwrap().contains("not found"));
+        assert!(!st.contains_key("lazy"));
+        assert!(d.path().join("cache/tools").join(sha256_hex(b"jq-binary")).is_file());
     }
 }
