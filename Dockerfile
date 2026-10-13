@@ -21,11 +21,11 @@ RUN case "$TARGETARCH" in \
       arm64) echo aarch64-unknown-linux-musl ;; \
       *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac > /target-triple
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,id=carry-target-${TARGETARCH} \
     cargo zigbuild --release --locked --target "$(cat /target-triple)"
 COPY src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,id=carry-target-${TARGETARCH} \
     touch src/main.rs \
  && cargo zigbuild --release --locked --target "$(cat /target-triple)" \

@@ -3,7 +3,9 @@ use std::process::{Command, Output};
 
 fn run(cfg: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_carry"));
-    c.args(args).env("CARRY_CONFIG", cfg).env_remove("CARRY_PROFILE");
+    c.args(args)
+        .env("CARRY_CONFIG", cfg)
+        .env_remove("CARRY_PROFILE");
     for (k, v) in envs {
         c.env(k, v);
     }
@@ -24,10 +26,18 @@ fn precedence_flag_env_profile() {
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stdout).contains("readonly"));
     // flag --profile dev beats env ro -> passes the guard.
-    let o = run(&p, &["--json", "--profile", "dev", "init"], &[("CARRY_PROFILE", "ro")]);
+    let o = run(
+        &p,
+        &["--json", "--profile", "dev", "init"],
+        &[("CARRY_PROFILE", "ro")],
+    );
     assert!(!String::from_utf8_lossy(&o.stdout).contains("readonly"));
     // profile current honours env over file.
-    let o = run(&p, &["--json", "profile", "current"], &[("CARRY_PROFILE", "ro")]);
+    let o = run(
+        &p,
+        &["--json", "profile", "current"],
+        &[("CARRY_PROFILE", "ro")],
+    );
     assert!(String::from_utf8_lossy(&o.stdout).contains("\"ro\""));
 }
 
@@ -37,9 +47,18 @@ fn env_repo_beats_profile_repo() {
     // does not break resolution under a profile.
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("c.yaml");
-    std::fs::write(&p, "current-profile: dev\nprofiles:\n  dev: {repo: s3://a/b}\n").unwrap();
+    std::fs::write(
+        &p,
+        "current-profile: dev\nprofiles:\n  dev: {repo: s3://a/b}\n",
+    )
+    .unwrap();
     let o = run(&p, &["--json", "states"], &[("CARRY_REPO", "s3://env/x")]);
-    assert_ne!(o.status.code(), Some(2), "{}", String::from_utf8_lossy(&o.stdout));
+    assert_ne!(
+        o.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
 }
 
 #[test]
@@ -51,10 +70,18 @@ fn keygen_out_with_missing_signing_key_file() {
     // CARRY_TOOL_SIGNING_KEY_FILE names the file keygen is about to create.
     let envs = [("CARRY_TOOL_SIGNING_KEY_FILE", k)];
     let o = run(&cfg, &["--json", "tool", "keygen", "--out", k], &envs);
-    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stdout));
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
     assert!(String::from_utf8_lossy(&o.stdout).contains("public_key"));
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     // Refuses to overwrite.
     let o = run(&cfg, &["--json", "tool", "keygen", "--out", k], &envs);
     assert_ne!(o.status.code(), Some(0));

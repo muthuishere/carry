@@ -30,14 +30,21 @@ pub async fn run(s: &Settings, cmd: Vec<String>) -> i32 {
     }
     let manifest = restore::current_manifest(&root);
     let stored_env = manifest.as_ref().map(|m| m.env.clone()).unwrap_or_default();
-    let apps = manifest.as_ref().map(|m| m.apps.clone()).unwrap_or_default();
+    let apps = manifest
+        .as_ref()
+        .map(|m| m.apps.clone())
+        .unwrap_or_default();
     if let Some(m) = &manifest {
         restore::materialise(&root, m);
         link(&root, &m.apps);
     }
     // Required tools: fetched before the app starts, within what is left of the restore
     // budget. A failure or timeout is reported and never blocks the start.
-    let required: BTreeMap<_, _> = apps.iter().filter(|(_, t)| t.required).map(|(n, t)| (n.clone(), t.clone())).collect();
+    let required: BTreeMap<_, _> = apps
+        .iter()
+        .filter(|(_, t)| t.required)
+        .map(|(n, t)| (n.clone(), t.clone()))
+        .collect();
     if !required.is_empty() {
         let left = budget.saturating_sub(Duration::from_millis(r.ms));
         match tokio::time::timeout(left, crate::tools::prefetch_tools(s, &root, &required, true)).await {
@@ -50,7 +57,9 @@ pub async fn run(s: &Settings, cmd: Vec<String>) -> i32 {
         Ok(p) => {
             env.insert(LAUNCHER_ENV.into(), p.display().to_string());
         }
-        Err(e) => eprintln!("carry: warning: cannot write launcher settings ({e}); tools may not reach the repo"),
+        Err(e) => eprintln!(
+            "carry: warning: cannot write launcher settings ({e}); tools may not reach the repo"
+        ),
     }
 
     let mut command = tokio::process::Command::new(&cmd[0]);
@@ -62,13 +71,19 @@ pub async fn run(s: &Settings, cmd: Vec<String>) -> i32 {
             return 127;
         }
     };
-    let Some(pid) = child.id().map(|p| Pid::from_raw(p as i32)) else { return 1 };
+    let Some(pid) = child.id().map(|p| Pid::from_raw(p as i32)) else {
+        return 1;
+    };
 
     // Background follower: isolated in its own task, so a panic cannot reach the child.
     let follower = {
         let s = s.clone();
         tokio::spawn(async move {
-            if AssertUnwindSafe(follow(s, state, pid, r.version)).catch_unwind().await.is_err() {
+            if AssertUnwindSafe(follow(s, state, pid, r.version))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
                 eprintln!("carry: background follower panicked; app keeps running");
             }
         })
@@ -78,7 +93,9 @@ pub async fn run(s: &Settings, cmd: Vec<String>) -> i32 {
     let prefetch: BTreeMap<_, _> = apps.into_iter().filter(|(_, t)| t.prefetch).collect();
     let prefetcher = (!prefetch.is_empty()).then(|| {
         let (s, root) = (s.clone(), root.clone());
-        tokio::spawn(async move { report_prefetch(&crate::tools::prefetch_tools(&s, &root, &prefetch, false).await) })
+        tokio::spawn(async move {
+            report_prefetch(&crate::tools::prefetch_tools(&s, &root, &prefetch, false).await)
+        })
     });
 
     let code = if nix::unistd::getpid().as_raw() == 1 {
@@ -137,7 +154,10 @@ pub fn write_launcher_env(s: &Settings, root: &Path) -> std::io::Result<std::pat
     add("CARRY_S3_REGION", s.region.as_deref());
     add("AWS_ACCESS_KEY_ID", s.access_key_id.as_deref());
     add("AWS_SECRET_ACCESS_KEY", s.secret_access_key.as_deref());
-    add("AWS_SESSION_TOKEN", std::env::var("AWS_SESSION_TOKEN").ok().as_deref());
+    add(
+        "AWS_SESSION_TOKEN",
+        std::env::var("AWS_SESSION_TOKEN").ok().as_deref(),
+    );
     add("CARRY_KEY", s.master_key.as_deref());
     add("CARRY_TOOL_PUBKEY", s.tool_pubkey.as_deref());
     if s.no_encryption {
@@ -181,7 +201,10 @@ pub fn child_env(
     for k in STRIPPED_ENV {
         env.remove(*k);
     }
-    let path = env.get("PATH").cloned().unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    let path = env
+        .get("PATH")
+        .cloned()
+        .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
     env.insert("PATH".into(), format!("{}:{path}", bin.display()));
     env
 }
@@ -201,7 +224,9 @@ fn exec(cmd: &[String]) -> i32 {
 
 fn exit_code(st: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
-    st.code().or_else(|| st.signal().map(|s| 128 + s)).unwrap_or(1)
+    st.code()
+        .or_else(|| st.signal().map(|s| 128 + s))
+        .unwrap_or(1)
 }
 
 async fn forward_signals(pid: Pid) {
@@ -233,7 +258,10 @@ async fn forward_signals(pid: Pid) {
 
 /// PID 1: reap every zombie; return when our child exits.
 async fn reap_as_init(child: Pid) -> i32 {
-    reap_with(child, || waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG))).await
+    reap_with(child, || {
+        waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG))
+    })
+    .await
 }
 
 async fn reap_with(child: Pid, mut wait: impl FnMut() -> nix::Result<WaitStatus>) -> i32 {
@@ -291,7 +319,11 @@ pub fn parse_signal(v: &str) -> Option<Signal> {
         return Signal::try_from(n).ok();
     }
     let up = v.trim().to_ascii_uppercase();
-    let name = if up.starts_with("SIG") { up } else { format!("SIG{up}") };
+    let name = if up.starts_with("SIG") {
+        up
+    } else {
+        format!("SIG{up}")
+    };
     name.parse().ok()
 }
 
@@ -301,8 +333,15 @@ mod tests {
 
     #[test]
     fn env_precedence() {
-        let stored: BTreeMap<_, _> = [("A", "stored"), ("B", "stored")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        let env = child_env(&stored, vec![("B".into(), "proc".into()), ("PATH".into(), "/bin".into())], Path::new("/c/bin"));
+        let stored: BTreeMap<_, _> = [("A", "stored"), ("B", "stored")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let env = child_env(
+            &stored,
+            vec![("B".into(), "proc".into()), ("PATH".into(), "/bin".into())],
+            Path::new("/c/bin"),
+        );
         assert_eq!(env["A"], "stored");
         assert_eq!(env["B"], "proc");
         assert_eq!(env["PATH"], "/c/bin:/bin");
@@ -310,8 +349,14 @@ mod tests {
 
     #[test]
     fn secrets_are_stripped_from_child_env() {
-        let stored: BTreeMap<String, String> = [("CARRY_KEY".to_string(), "s".to_string())].into_iter().collect();
-        let proc: Vec<(String, String)> = STRIPPED_ENV.iter().map(|k| (k.to_string(), "secret".to_string())).chain([("KEEP".into(), "1".into())]).collect();
+        let stored: BTreeMap<String, String> = [("CARRY_KEY".to_string(), "s".to_string())]
+            .into_iter()
+            .collect();
+        let proc: Vec<(String, String)> = STRIPPED_ENV
+            .iter()
+            .map(|k| (k.to_string(), "secret".to_string()))
+            .chain([("KEEP".into(), "1".into())])
+            .collect();
         let env = child_env(&stored, proc, Path::new("/c/bin"));
         for k in STRIPPED_ENV {
             assert!(!env.contains_key(*k), "{k} leaked");
@@ -323,24 +368,41 @@ mod tests {
     fn launcher_env_file_is_private() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let tmp = tempfile::tempdir().unwrap();
-        let s = Settings { repo: Some("s3://b/p".into()), master_key: Some("k".into()), secret_access_key: Some("sk".into()), ..settings(tmp.path()) };
+        let s = Settings {
+            repo: Some("s3://b/p".into()),
+            master_key: Some("k".into()),
+            secret_access_key: Some("sk".into()),
+            ..settings(tmp.path())
+        };
         let p = write_launcher_env(&s, tmp.path()).unwrap();
         let md = std::fs::metadata(&p).unwrap();
         assert_eq!(md.permissions().mode() & 0o777, 0o600);
         assert_eq!(md.uid(), nix::unistd::geteuid().as_raw());
         let text = std::fs::read_to_string(&p).unwrap();
-        assert!(text.contains("CARRY_REPO=s3://b/p\n") && text.contains("CARRY_KEY=k\n") && text.contains("AWS_SECRET_ACCESS_KEY=sk\n"));
+        assert!(
+            text.contains("CARRY_REPO=s3://b/p\n")
+                && text.contains("CARRY_KEY=k\n")
+                && text.contains("AWS_SECRET_ACCESS_KEY=sk\n")
+        );
     }
 
     #[tokio::test]
     async fn reaper_treats_echild_as_child_gone() {
         let me = Pid::from_raw(4242);
-        let r = tokio::time::timeout(Duration::from_secs(3), reap_with(me, || Err(nix::errno::Errno::ECHILD))).await;
+        let r = tokio::time::timeout(
+            Duration::from_secs(3),
+            reap_with(me, || Err(nix::errno::Errno::ECHILD)),
+        )
+        .await;
         assert_eq!(r.unwrap(), 1);
         let mut n = 0;
         let r = reap_with(me, || {
             n += 1;
-            if n == 1 { Ok(WaitStatus::Exited(Pid::from_raw(7), 0)) } else { Ok(WaitStatus::Exited(me, 3)) }
+            if n == 1 {
+                Ok(WaitStatus::Exited(Pid::from_raw(7), 0))
+            } else {
+                Ok(WaitStatus::Exited(me, 3))
+            }
         });
         assert_eq!(r.await, 3);
     }
@@ -373,9 +435,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = settings(tmp.path());
         let t = std::time::Instant::now();
-        assert_eq!(run(&s, vec!["sh".into(), "-c".into(), "exit 7".into()]).await, 7);
+        assert_eq!(
+            run(&s, vec!["sh".into(), "-c".into(), "exit 7".into()]).await,
+            7
+        );
         assert!(t.elapsed() < Duration::from_millis(1300));
-        assert_eq!(run(&s, vec!["sh".into(), "-c".into(), "kill -TERM $$".into()]).await, 128 + 15);
+        assert_eq!(
+            run(&s, vec!["sh".into(), "-c".into(), "kill -TERM $$".into()]).await,
+            128 + 15
+        );
         assert_eq!(run(&s, vec!["/nonexistent/bin".into()]).await, 127);
     }
 }

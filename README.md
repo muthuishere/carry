@@ -15,7 +15,7 @@ Containers lose everything added after the image was built. carry restores confi
 
 ```dockerfile
 FROM nginx:1.27
-COPY --from=muthuishere/carry:0.1.0 /carry /usr/local/bin/carry
+COPY --from=ghcr.io/muthuishere/carry:0.1.0 /carry /usr/local/bin/carry
 ENTRYPOINT ["carry", "run", "--"]
 CMD ["nginx", "-g", "daemon off;"]
 ```

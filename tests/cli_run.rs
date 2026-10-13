@@ -6,7 +6,14 @@ fn carry(root: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Output
     c.args(args)
         .env("CARRY_ROOT", root)
         .env("CARRY_CONFIG", root.join("none.yaml"));
-    for v in ["CARRY_PROFILE", "CARRY_REPO", "CARRY_KEY", "CARRY_KEY_FILE", "CARRY_STATE", "CARRY_S3_ENDPOINT"] {
+    for v in [
+        "CARRY_PROFILE",
+        "CARRY_REPO",
+        "CARRY_KEY",
+        "CARRY_KEY_FILE",
+        "CARRY_STATE",
+        "CARRY_S3_ENDPOINT",
+    ] {
         c.env_remove(v);
     }
     for (k, v) in envs {
@@ -42,8 +49,17 @@ fn unreachable_store_degrades_and_runs() {
     let t = tempfile::tempdir().unwrap();
     let start = Instant::now();
     let o = carry(t.path(), &["run", "--", "sh", "-c", "exit 7"], UNREACHABLE);
-    assert!(start.elapsed() < Duration::from_millis(1500), "{:?}", start.elapsed());
-    assert_eq!(o.status.code(), Some(7), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        start.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     let s = carry(t.path(), &["status", "--json"], UNREACHABLE);
     let v: serde_json::Value = serde_json::from_slice(&s.stdout).unwrap();
     assert_eq!(v["result"]["mode"], "degraded");

@@ -2,8 +2,8 @@
 //! See openspec/changes/carry-v0-1/design.md for this module's surface.
 #![allow(dead_code)]
 
-use crate::crypto::{Cipher, DataKey, MasterKey, WrappedKey};
 use crate::crypto::{frame_header, CHUNK_SIZE, CHUNK_THRESHOLD, FMT_CHUNKED};
+use crate::crypto::{Cipher, DataKey, MasterKey, WrappedKey};
 use crate::error::{CarryError, Result};
 use crate::model::{Head, Manifest, FORMAT_VERSION};
 use crate::store::Store;
@@ -70,9 +70,15 @@ fn lease_key(state: &str) -> String {
 fn check_state(state: &str) -> Result<()> {
     let ok = !state.is_empty()
         && state.len() <= 128
-        && state.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        && state
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
         && !state.starts_with('.');
-    if ok { Ok(()) } else { Err(CarryError::Usage(format!("invalid state name '{state}'"))) }
+    if ok {
+        Ok(())
+    } else {
+        Err(CarryError::Usage(format!("invalid state name '{state}'")))
+    }
 }
 fn check_id(id: &str) -> Result<()> {
     if id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -108,22 +114,34 @@ impl Repo {
                     (cfg, Cipher::Encrypted(dk))
                 }
                 None if allow_no_encryption => (
-                    RepoConfig { format: FORMAT_VERSION, encrypted: false, cipher: "none+zstd".into(), wrapped_keys: vec![] },
+                    RepoConfig {
+                        format: FORMAT_VERSION,
+                        encrypted: false,
+                        cipher: "none+zstd".into(),
+                        wrapped_keys: vec![],
+                    },
                     Cipher::None,
                 ),
                 None => {
                     return Err(CarryError::BadKey(
-                        "no master key: set CARRY_KEY or CARRY_KEY_FILE (or --no-encryption)".into(),
+                        "no master key: set CARRY_KEY or CARRY_KEY_FILE (or --no-encryption)"
+                            .into(),
                     ))
                 }
             };
             let body = serde_json::to_vec_pretty(&cfg).map_err(json_err)?;
             if store.put_if_absent(CONFIG_KEY, Bytes::from(body)).await? {
-                return Ok(Repo { store, config: cfg, cipher });
+                return Ok(Repo {
+                    store,
+                    config: cfg,
+                    cipher,
+                });
             }
             // Lost the race: loop and load the winner's config.
         }
-        Err(CarryError::Conflict("could not read or create repository config".into()))
+        Err(CarryError::Conflict(
+            "could not read or create repository config".into(),
+        ))
     }
 
     /// Open an existing repo only; NotFound if no config.
@@ -138,15 +156,26 @@ impl Repo {
     fn from_config(store: Store, raw: &[u8], mk: Option<&MasterKey>) -> Result<Repo> {
         let config: RepoConfig = serde_json::from_slice(raw).map_err(json_err)?;
         if config.format > FORMAT_VERSION {
-            return Err(CarryError::Invalid(format!("repository format {} is newer than this carry", config.format)));
+            return Err(CarryError::Invalid(format!(
+                "repository format {} is newer than this carry",
+                config.format
+            )));
         }
         let cipher = if config.encrypted {
-            let mk = mk.ok_or_else(|| CarryError::BadKey("repository is encrypted; set CARRY_KEY or CARRY_KEY_FILE".into()))?;
+            let mk = mk.ok_or_else(|| {
+                CarryError::BadKey(
+                    "repository is encrypted; set CARRY_KEY or CARRY_KEY_FILE".into(),
+                )
+            })?;
             Cipher::Encrypted(DataKey::unwrap_any(&config.wrapped_keys, mk)?)
         } else {
             Cipher::None
         };
-        Ok(Repo { store, config, cipher })
+        Ok(Repo {
+            store,
+            config,
+            cipher,
+        })
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -209,18 +238,30 @@ impl Repo {
         self.get_to_at(id, blob_key, w).await
     }
 
-    pub async fn get_tool_blob_to<W: std::io::Write + Send>(&self, id: &str, w: &mut W) -> Result<u64> {
+    pub async fn get_tool_blob_to<W: std::io::Write + Send>(
+        &self,
+        id: &str,
+        w: &mut W,
+    ) -> Result<u64> {
         self.get_to_at(id, tool_blob_key, w).await
     }
 
     /// Upload from a seekable reader of exactly `size` bytes with bounded buffers.
     /// Pass 1 hashes (the id), pass 2 uploads (multipart for chunked blobs).
     /// Returns (id, uploaded).
-    pub async fn put_blob_from<R: std::io::Read + std::io::Seek + Send>(&self, r: R, size: u64) -> Result<(String, bool)> {
+    pub async fn put_blob_from<R: std::io::Read + std::io::Seek + Send>(
+        &self,
+        r: R,
+        size: u64,
+    ) -> Result<(String, bool)> {
         self.put_from_at(r, size, blob_key).await
     }
 
-    pub async fn put_tool_blob_from<R: std::io::Read + std::io::Seek + Send>(&self, r: R, size: u64) -> Result<(String, bool)> {
+    pub async fn put_tool_blob_from<R: std::io::Read + std::io::Seek + Send>(
+        &self,
+        r: R,
+        size: u64,
+    ) -> Result<(String, bool)> {
         self.put_from_at(r, size, tool_blob_key).await
     }
 
@@ -245,7 +286,9 @@ impl Repo {
             seen += n as u64;
         }
         if seen != size {
-            return Err(CarryError::Invalid(format!("source changed while reading ({seen} != {size} bytes)")));
+            return Err(CarryError::Invalid(format!(
+                "source changed while reading ({seen} != {size} bytes)"
+            )));
         }
         let id = h.finalize().to_hex().to_string();
         let key = keyf(&id);
@@ -259,7 +302,10 @@ impl Repo {
             if self.cipher.blob_id(&pt) != id {
                 return Err(CarryError::Invalid("source changed while reading".into()));
             }
-            let up = self.store.put_if_absent(&key, Bytes::from(self.cipher.encode_blob(&pt)?)).await?;
+            let up = self
+                .store
+                .put_if_absent(&key, Bytes::from(self.cipher.encode_blob(&pt)?))
+                .await?;
             return Ok((id, up));
         }
         let mut up = self.store.put_multipart(&key).await?;
@@ -276,14 +322,18 @@ impl Repo {
                 part.extend_from_slice(&enc.frame(&buf[..n], left == 0)?);
                 if part.len() >= PART_SIZE {
                     let p = std::mem::take(&mut part);
-                    up.put_part(object_store::PutPayload::from(p)).await.map_err(crate::store::map_err)?;
+                    up.put_part(object_store::PutPayload::from(p))
+                        .await
+                        .map_err(crate::store::map_err)?;
                 }
             }
             if h2.finalize().to_hex().as_str() != id {
                 return Err(CarryError::Invalid("source changed while reading".into()));
             }
             if !part.is_empty() {
-                up.put_part(object_store::PutPayload::from(part)).await.map_err(crate::store::map_err)?;
+                up.put_part(object_store::PutPayload::from(part))
+                    .await
+                    .map_err(crate::store::map_err)?;
             }
             up.complete().await.map_err(crate::store::map_err)?;
             Ok(())
@@ -296,7 +346,12 @@ impl Repo {
         Ok((id, true))
     }
 
-    async fn get_to_at<W: std::io::Write + Send>(&self, id: &str, keyf: fn(&str) -> String, w: &mut W) -> Result<u64> {
+    async fn get_to_at<W: std::io::Write + Send>(
+        &self,
+        id: &str,
+        keyf: fn(&str) -> String,
+        w: &mut W,
+    ) -> Result<u64> {
         use futures::StreamExt;
         check_id(id)?;
         let wr = |e: std::io::Error| CarryError::Internal(anyhow::anyhow!("write: {e}"));
@@ -345,11 +400,15 @@ impl Repo {
                     if dec.done {
                         // Drain: anything left is an error.
                         if pos != buf.len() {
-                            return Err(CarryError::Invalid(format!("blob {id}: data after final chunk")));
+                            return Err(CarryError::Invalid(format!(
+                                "blob {id}: data after final chunk"
+                            )));
                         }
                         while let Some(c) = s.next().await {
                             if !c?.is_empty() {
-                                return Err(CarryError::Invalid(format!("blob {id}: data after final chunk")));
+                                return Err(CarryError::Invalid(format!(
+                                    "blob {id}: data after final chunk"
+                                )));
                             }
                         }
                         break;
@@ -363,7 +422,11 @@ impl Repo {
                 }
                 match s.next().await {
                     Some(c) => buf.extend_from_slice(&c?),
-                    None => return Err(CarryError::Invalid(format!("blob {id}: truncated (no final chunk)"))),
+                    None => {
+                        return Err(CarryError::Invalid(format!(
+                            "blob {id}: truncated (no final chunk)"
+                        )))
+                    }
                 }
             }
         } else {
@@ -376,7 +439,9 @@ impl Repo {
             total = pt.len() as u64;
         }
         if h.finalize().to_hex().as_str() != id {
-            return Err(CarryError::Invalid(format!("blob {id} content does not match its id")));
+            return Err(CarryError::Invalid(format!(
+                "blob {id} content does not match its id"
+            )));
         }
         w.flush().map_err(wr)?;
         Ok(total)
@@ -402,13 +467,21 @@ impl Repo {
         check_id(id)?;
         let raw = self.store.get(&format!("manifests/{id}")).await?;
         let (json, v2) = self.cipher.open_manifest(&raw, state)?;
-        let want = if v2 { self.cipher.manifest_id(&json) } else { self.cipher.blob_id(&json) };
+        let want = if v2 {
+            self.cipher.manifest_id(&json)
+        } else {
+            self.cipher.blob_id(&json)
+        };
         if want != id {
-            return Err(CarryError::Invalid(format!("manifest {id} does not match its id")));
+            return Err(CarryError::Invalid(format!(
+                "manifest {id} does not match its id"
+            )));
         }
         let m: Manifest = serde_json::from_slice(&json).map_err(json_err)?;
         if v2 && m.state != state || !m.state.is_empty() && m.state != state {
-            return Err(CarryError::Invalid(format!("manifest {id} belongs to another state")));
+            return Err(CarryError::Invalid(format!(
+                "manifest {id} belongs to another state"
+            )));
         }
         Ok(m)
     }
@@ -424,25 +497,40 @@ impl Repo {
 
     /// Write manifest, then move HEAD by CAS. `expected_etag = None` means "state must not exist yet".
     /// Conflict if someone else moved HEAD.
-    pub async fn commit(&self, state: &str, expected_etag: Option<String>, manifest: &Manifest) -> Result<Head> {
+    pub async fn commit(
+        &self,
+        state: &str,
+        expected_etag: Option<String>,
+        manifest: &Manifest,
+    ) -> Result<Head> {
         check_state(state)?;
         let mut bound = manifest.clone();
         bound.state = state.to_string();
         let manifest = &bound;
         let id = self.write_manifest(manifest).await?;
-        let head = Head { manifest: id, seq: manifest.seq };
+        let head = Head {
+            manifest: id,
+            seq: manifest.seq,
+        };
         let body = Bytes::from(serde_json::to_vec(&head).map_err(json_err)?);
         match expected_etag {
             None => {
                 if !self.store.put_if_absent(&head_key(state), body).await? {
-                    return Err(CarryError::Conflict(format!("state '{state}' was created concurrently")));
+                    return Err(CarryError::Conflict(format!(
+                        "state '{state}' was created concurrently"
+                    )));
                 }
             }
             Some(etag) => {
-                self.store.put_if_match(&head_key(state), body, &etag).await.map_err(|e| match e {
-                    CarryError::Conflict(_) => CarryError::Conflict(format!("state '{state}' moved concurrently")),
-                    e => e,
-                })?;
+                self.store
+                    .put_if_match(&head_key(state), body, &etag)
+                    .await
+                    .map_err(|e| match e {
+                        CarryError::Conflict(_) => {
+                            CarryError::Conflict(format!("state '{state}' moved concurrently"))
+                        }
+                        e => e,
+                    })?;
             }
         }
         Ok(head)
@@ -454,7 +542,11 @@ impl Repo {
             .list("refs/")
             .await?
             .into_iter()
-            .filter_map(|k| k.strip_prefix("refs/").and_then(|r| r.strip_suffix("/HEAD")).map(str::to_string))
+            .filter_map(|k| {
+                k.strip_prefix("refs/")
+                    .and_then(|r| r.strip_suffix("/HEAD"))
+                    .map(str::to_string)
+            })
             .collect();
         v.sort();
         Ok(v)
@@ -463,15 +555,28 @@ impl Repo {
     // ---- lease ----
 
     /// Take `refs/<state>/lease` for `ttl_secs` (default 15 s). Conflict if another live holder has it.
-    pub async fn acquire_lease(&self, state: &str, holder: &str, ttl_secs: Option<i64>) -> Result<Lease> {
+    pub async fn acquire_lease(
+        &self,
+        state: &str,
+        holder: &str,
+        ttl_secs: Option<i64>,
+    ) -> Result<Lease> {
         check_state(state)?;
         let key = lease_key(state);
         let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.unwrap_or(LEASE_TTL_SECS));
-        let body = Bytes::from(serde_json::to_vec(&LeaseRecord { holder: holder.into(), expires }).map_err(json_err)?);
+        let body = Bytes::from(
+            serde_json::to_vec(&LeaseRecord {
+                holder: holder.into(),
+                expires,
+            })
+            .map_err(json_err)?,
+        );
         match self.store.get_with_etag(&key).await? {
             None => {
                 if !self.store.put_if_absent(&key, body).await? {
-                    return Err(CarryError::Conflict(format!("lease on '{state}' taken concurrently")));
+                    return Err(CarryError::Conflict(format!(
+                        "lease on '{state}' taken concurrently"
+                    )));
                 }
             }
             Some((b, etag)) => {
@@ -485,19 +590,39 @@ impl Repo {
                 self.store.put_if_match(&key, body, &etag).await?;
             }
         }
-        let (_, etag) = self.store.get_with_etag(&key).await?.ok_or_else(|| CarryError::Conflict("lease vanished".into()))?;
-        Ok(Lease { state: state.into(), holder: holder.into(), expires, etag })
+        let (_, etag) = self
+            .store
+            .get_with_etag(&key)
+            .await?
+            .ok_or_else(|| CarryError::Conflict("lease vanished".into()))?;
+        Ok(Lease {
+            state: state.into(),
+            holder: holder.into(),
+            expires,
+            etag,
+        })
     }
 
     /// Extend a held lease. Conflict if it was lost.
     pub async fn renew_lease(&self, lease: &mut Lease, ttl_secs: Option<i64>) -> Result<()> {
         let expires = Utc::now() + chrono::Duration::seconds(ttl_secs.unwrap_or(LEASE_TTL_SECS));
         let body = Bytes::from(
-            serde_json::to_vec(&LeaseRecord { holder: lease.holder.clone(), expires }).map_err(json_err)?,
+            serde_json::to_vec(&LeaseRecord {
+                holder: lease.holder.clone(),
+                expires,
+            })
+            .map_err(json_err)?,
         );
-        let etag = self.store.put_if_match(&lease_key(&lease.state), body, &lease.etag).await?;
+        let etag = self
+            .store
+            .put_if_match(&lease_key(&lease.state), body, &lease.etag)
+            .await?;
         lease.etag = if etag.is_empty() {
-            self.store.head(&lease_key(&lease.state)).await?.map(|h| h.1).unwrap_or_default()
+            self.store
+                .head(&lease_key(&lease.state))
+                .await?
+                .map(|h| h.1)
+                .unwrap_or_default()
         } else {
             etag
         };
@@ -511,12 +636,17 @@ impl Repo {
     /// over in the meantime is never touched.
     pub async fn release_lease(&self, lease: Lease) -> Result<()> {
         let key = lease_key(&lease.state);
-        let Some((b, etag)) = self.store.get_with_etag(&key).await? else { return Ok(()) };
+        let Some((b, etag)) = self.store.get_with_etag(&key).await? else {
+            return Ok(());
+        };
         let cur: LeaseRecord = serde_json::from_slice(&b).map_err(json_err)?;
         if cur.holder != lease.holder || etag != lease.etag {
             return Ok(());
         }
-        let expired = LeaseRecord { holder: lease.holder.clone(), expires: DateTime::<Utc>::UNIX_EPOCH };
+        let expired = LeaseRecord {
+            holder: lease.holder.clone(),
+            expires: DateTime::<Utc>::UNIX_EPOCH,
+        };
         let body = Bytes::from(serde_json::to_vec(&expired).map_err(json_err)?);
         match self.store.put_if_match(&key, body, &etag).await {
             Ok(_) | Err(CarryError::Conflict(_)) => Ok(()),
@@ -546,20 +676,34 @@ impl Repo {
 
     pub async fn put_tool_json<T: Serialize>(&self, key: &str, v: &T) -> Result<()> {
         let key = tools_key(key)?;
-        self.store.put(&key, Bytes::from(serde_json::to_vec_pretty(v).map_err(json_err)?)).await?;
+        self.store
+            .put(
+                &key,
+                Bytes::from(serde_json::to_vec_pretty(v).map_err(json_err)?),
+            )
+            .await?;
         Ok(())
     }
 
     /// Ok(false) if the key already exists (e.g. an immutable version).
     pub async fn put_tool_json_if_absent<T: Serialize>(&self, key: &str, v: &T) -> Result<bool> {
         let key = tools_key(key)?;
-        self.store.put_if_absent(&key, Bytes::from(serde_json::to_vec_pretty(v).map_err(json_err)?)).await
+        self.store
+            .put_if_absent(
+                &key,
+                Bytes::from(serde_json::to_vec_pretty(v).map_err(json_err)?),
+            )
+            .await
     }
 }
 
 fn tools_key(key: &str) -> Result<String> {
     let k = key.trim_start_matches('/');
-    let k = if k.starts_with("tools/") { k.to_string() } else { format!("tools/{k}") };
+    let k = if k.starts_with("tools/") {
+        k.to_string()
+    } else {
+        format!("tools/{k}")
+    };
     if k.split('/').any(|s| s == ".." || s.is_empty()) {
         return Err(CarryError::Usage(format!("bad tool key '{key}'")));
     }
@@ -581,19 +725,34 @@ pub async fn doctor_conditional_writes(store: &Store) -> Result<ConditionalWrite
         if !if_none_match {
             detail.push("If-None-Match: * overwrote an existing object".into());
         }
-        let (_, e1) = store.get_with_etag(&key).await?.ok_or_else(|| CarryError::Invalid("probe vanished".into()))?;
-        let good = store.put_if_match(&key, Bytes::from_static(b"3"), &e1).await;
-        let stale = store.put_if_match(&key, Bytes::from_static(b"4"), &e1).await;
+        let (_, e1) = store
+            .get_with_etag(&key)
+            .await?
+            .ok_or_else(|| CarryError::Invalid("probe vanished".into()))?;
+        let good = store
+            .put_if_match(&key, Bytes::from_static(b"3"), &e1)
+            .await;
+        let stale = store
+            .put_if_match(&key, Bytes::from_static(b"4"), &e1)
+            .await;
         if_match = good.is_ok() && matches!(stale, Err(CarryError::Conflict(_)));
         if !if_match {
-            detail.push(format!("If-Match: matching put ok={}, stale put conflict={}", good.is_ok(), matches!(stale, Err(CarryError::Conflict(_)))));
+            detail.push(format!(
+                "If-Match: matching put ok={}, stale put conflict={}",
+                good.is_ok(),
+                matches!(stale, Err(CarryError::Conflict(_)))
+            ));
         }
         Ok(())
     }
     .await;
     let _ = store.delete(&key).await;
     res?;
-    Ok(ConditionalWriteReport { if_none_match, if_match, detail })
+    Ok(ConditionalWriteReport {
+        if_none_match,
+        if_match,
+        detail,
+    })
 }
 
 #[cfg(test)]
@@ -611,7 +770,12 @@ pub(crate) mod tests {
             format: FORMAT_VERSION,
             parent,
             seq,
-            op: Op { kind: "init".into(), args: vec![], at: Utc::now(), by: "t".into() },
+            op: Op {
+                kind: "init".into(),
+                args: vec![],
+                at: Utc::now(),
+                by: "t".into(),
+            },
             entries: Default::default(),
             env: Default::default(),
             apps: Default::default(),
@@ -623,41 +787,81 @@ pub(crate) mod tests {
     async fn repo_in_memory() {
         let s = mem();
         let mk = MasterKey::generate();
-        let r = Repo::open_or_init(s.clone(), Some(mk.clone()), false).await.unwrap();
+        let r = Repo::open_or_init(s.clone(), Some(mk.clone()), false)
+            .await
+            .unwrap();
         let id = r.put_blob(b"data").await.unwrap();
-        assert_eq!(r.put_blob_report(b"data").await.unwrap(), (id.clone(), false));
+        assert_eq!(
+            r.put_blob_report(b"data").await.unwrap(),
+            (id.clone(), false)
+        );
         assert_eq!(&r.get_blob(&id).await.unwrap()[..], b"data");
         let h = r.commit("web-1", None, &manifest(1, None)).await.unwrap();
-        assert!(matches!(r.commit("web-1", None, &manifest(1, None)).await, Err(CarryError::Conflict(_))));
+        assert!(matches!(
+            r.commit("web-1", None, &manifest(1, None)).await,
+            Err(CarryError::Conflict(_))
+        ));
         let (h2, etag) = r.read_head("web-1").await.unwrap().unwrap();
         assert_eq!(h, h2);
-        r.commit("web-1", Some(etag.clone()), &manifest(2, Some(h.manifest.clone()))).await.unwrap();
-        assert!(matches!(r.commit("web-1", Some(etag), &manifest(2, None)).await, Err(CarryError::Conflict(_))));
+        r.commit(
+            "web-1",
+            Some(etag.clone()),
+            &manifest(2, Some(h.manifest.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            r.commit("web-1", Some(etag), &manifest(2, None)).await,
+            Err(CarryError::Conflict(_))
+        ));
         assert_eq!(r.list_states().await.unwrap(), vec!["web-1"]);
         assert_eq!(r.load_manifest("web-1", &h.manifest).await.unwrap().seq, 1);
 
         let mut l = r.acquire_lease("web-1", "a", None).await.unwrap();
-        assert!(matches!(r.acquire_lease("web-1", "b", None).await, Err(CarryError::Conflict(_))));
+        assert!(matches!(
+            r.acquire_lease("web-1", "b", None).await,
+            Err(CarryError::Conflict(_))
+        ));
         r.renew_lease(&mut l, None).await.unwrap();
         r.release_lease(l).await.unwrap();
         let lb = r.acquire_lease("web-1", "b", None).await.unwrap();
         // A stale holder's release must not touch b's lease.
-        let stale = Lease { state: "web-1".into(), holder: "b".into(), expires: Utc::now(), etag: "nope".into() };
+        let stale = Lease {
+            state: "web-1".into(),
+            holder: "b".into(),
+            expires: Utc::now(),
+            etag: "nope".into(),
+        };
         r.release_lease(stale).await.unwrap();
-        assert!(matches!(r.acquire_lease("web-1", "c", None).await, Err(CarryError::Conflict(_))));
+        assert!(matches!(
+            r.acquire_lease("web-1", "c", None).await,
+            Err(CarryError::Conflict(_))
+        ));
         r.release_lease(lb).await.unwrap();
         r.acquire_lease("web-1", "c", None).await.unwrap();
 
         // Manifests are bound to their state: another state's manifest is refused.
         let hb = r.commit("web-2", None, &manifest(1, None)).await.unwrap();
-        assert_eq!(r.load_manifest("web-2", &hb.manifest).await.unwrap().state, "web-2");
-        assert!(matches!(r.load_manifest("web-1", &hb.manifest).await, Err(CarryError::Invalid(_))));
+        assert_eq!(
+            r.load_manifest("web-2", &hb.manifest).await.unwrap().state,
+            "web-2"
+        );
+        assert!(matches!(
+            r.load_manifest("web-1", &hb.manifest).await,
+            Err(CarryError::Invalid(_))
+        ));
 
         let t = r.put_tool_blob(b"bin").await.unwrap();
         assert_eq!(&r.get_tool_blob(&t).await.unwrap()[..], b"bin");
 
-        assert!(matches!(Repo::open(s.clone(), Some(MasterKey::generate())).await, Err(CarryError::BadKey(_))));
-        assert!(matches!(Repo::open(s, None).await, Err(CarryError::BadKey(_))));
+        assert!(matches!(
+            Repo::open(s.clone(), Some(MasterKey::generate())).await,
+            Err(CarryError::BadKey(_))
+        ));
+        assert!(matches!(
+            Repo::open(s, None).await,
+            Err(CarryError::BadKey(_))
+        ));
 
         let rep = doctor_conditional_writes(&mem()).await.unwrap();
         assert!(rep.if_none_match && rep.if_match);
@@ -674,7 +878,8 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         let mut pos = 1 + prefix;
         while pos < raw.len() {
-            let (len, _) = crate::crypto::frame_header(raw[pos..pos + 4].try_into().unwrap()).unwrap();
+            let (len, _) =
+                crate::crypto::frame_header(raw[pos..pos + 4].try_into().unwrap()).unwrap();
             out.push((pos, 4 + len));
             pos += 4 + len;
         }
@@ -684,20 +889,35 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn chunked_blobs_stream_and_resist_truncation_and_reordering() {
         let s = mem();
-        let r = Repo::open_or_init(s.clone(), Some(crate::crypto::MasterKey::from_bytes([7; 32])), false).await.unwrap();
+        let r = Repo::open_or_init(
+            s.clone(),
+            Some(crate::crypto::MasterKey::from_bytes([7; 32])),
+            false,
+        )
+        .await
+        .unwrap();
         let data = noise(CHUNK_SIZE * 5 + 123);
         // Streaming put (multipart) and slice put agree on the id; dedup holds.
-        let (id, up) = r.put_blob_from(std::io::Cursor::new(&data), data.len() as u64).await.unwrap();
+        let (id, up) = r
+            .put_blob_from(std::io::Cursor::new(&data), data.len() as u64)
+            .await
+            .unwrap();
         assert!(up);
         assert_eq!(r.put_blob_report(&data).await.unwrap(), (id.clone(), false));
         assert_eq!(id, r.blob_id(&data));
         let raw = s.get(&blob_key(&id)).await.unwrap().to_vec();
         assert_eq!(raw[0], FMT_CHUNKED);
         let mut out = Vec::new();
-        assert_eq!(r.get_blob_to(&id, &mut out).await.unwrap(), data.len() as u64);
+        assert_eq!(
+            r.get_blob_to(&id, &mut out).await.unwrap(),
+            data.len() as u64
+        );
         assert!(out == data);
         // Size mismatch is refused.
-        assert!(r.put_blob_from(std::io::Cursor::new(&data), 5).await.is_err());
+        assert!(r
+            .put_blob_from(std::io::Cursor::new(&data), 5)
+            .await
+            .is_err());
 
         let fr = frames(&raw, crate::crypto::STREAM_PREFIX_LEN);
         assert_eq!(fr.len(), 6);
@@ -710,7 +930,10 @@ pub(crate) mod tests {
         };
         // Truncated: drop the final frame.
         let (lo, _) = fr[5];
-        assert!(matches!(check(raw[..lo].to_vec()).await, Err(CarryError::Invalid(_))));
+        assert!(matches!(
+            check(raw[..lo].to_vec()).await,
+            Err(CarryError::Invalid(_))
+        ));
         // Truncated at a non-final frame boundary, with the flag forged to "last".
         let (p4, l4) = fr[4];
         let mut forged = raw[..p4 + l4].to_vec();
@@ -734,25 +957,42 @@ pub(crate) mod tests {
         // Legacy headerless single-shot objects stay readable; new small ones carry FMT_SINGLE_V2 (blob-labelled AEAD).
         let small = b"legacy blob".to_vec();
         let sid = r.blob_id(&small);
-        s.put(&blob_key(&sid), Bytes::from(r.cipher.compress_seal(&small).unwrap())).await.unwrap();
+        s.put(
+            &blob_key(&sid),
+            Bytes::from(r.cipher.compress_seal(&small).unwrap()),
+        )
+        .await
+        .unwrap();
         assert_eq!(&r.get_blob(&sid).await.unwrap()[..], &small[..]);
         let nid = r.put_blob(b"fresh").await.unwrap();
-        assert_eq!(s.get(&blob_key(&nid)).await.unwrap()[0], crate::crypto::FMT_SINGLE_V2);
+        assert_eq!(
+            s.get(&blob_key(&nid)).await.unwrap()[0],
+            crate::crypto::FMT_SINGLE_V2
+        );
     }
 
     #[tokio::test]
     async fn chunked_unencrypted_and_empty() {
         let r = Repo::open_or_init(mem(), None, true).await.unwrap();
         let data = noise(CHUNK_SIZE * 4 + 1);
-        let (id, _) = r.put_blob_from(std::io::Cursor::new(&data), data.len() as u64).await.unwrap();
+        let (id, _) = r
+            .put_blob_from(std::io::Cursor::new(&data), data.len() as u64)
+            .await
+            .unwrap();
         assert!(r.get_blob(&id).await.unwrap() == data);
-        let (e, _) = r.put_blob_from(std::io::Cursor::new(Vec::new()), 0).await.unwrap();
+        let (e, _) = r
+            .put_blob_from(std::io::Cursor::new(Vec::new()), 0)
+            .await
+            .unwrap();
         assert!(r.get_blob(&e).await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn no_key_needs_flag() {
-        assert!(matches!(Repo::open_or_init(mem(), None, false).await, Err(CarryError::BadKey(_))));
+        assert!(matches!(
+            Repo::open_or_init(mem(), None, false).await,
+            Err(CarryError::BadKey(_))
+        ));
         let r = Repo::open_or_init(mem(), None, true).await.unwrap();
         assert!(!r.is_encrypted());
     }
@@ -810,12 +1050,18 @@ mod minio_tests {
 
         let h = r.commit("web-1", None, &manifest(1, None)).await.unwrap();
         let (_, etag) = r.read_head("web-1").await.unwrap().unwrap();
-        let (ma, mut mb) = (manifest(2, Some(h.manifest.clone())), manifest(2, Some(h.manifest.clone())));
+        let (ma, mut mb) = (
+            manifest(2, Some(h.manifest.clone())),
+            manifest(2, Some(h.manifest.clone())),
+        );
         mb.op.by = "other".into();
         let a = r.commit("web-1", Some(etag.clone()), &ma);
         let b = repos[1].commit("web-1", Some(etag.clone()), &mb);
         let (a, b) = tokio::join!(a, b);
-        assert!(a.is_ok() ^ b.is_ok(), "exactly one commit wins: {a:?} {b:?}");
+        assert!(
+            a.is_ok() ^ b.is_ok(),
+            "exactly one commit wins: {a:?} {b:?}"
+        );
         assert!(matches!(a.err().or(b.err()), Some(CarryError::Conflict(_))));
 
         let key = blob_key(&id);
@@ -843,7 +1089,10 @@ mod minio_tests {
         let r = Repo::open_or_init(s.clone(), None, true).await.unwrap();
         let mut data = vec![0u8; (CHUNK_SIZE * 19) + 77];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut data);
-        let (id, up) = r.put_blob_from(std::io::Cursor::new(&data), data.len() as u64).await.unwrap();
+        let (id, up) = r
+            .put_blob_from(std::io::Cursor::new(&data), data.len() as u64)
+            .await
+            .unwrap();
         assert!(up);
         let mut out = Vec::new();
         r.get_blob_to(&id, &mut out).await.unwrap();

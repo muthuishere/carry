@@ -122,14 +122,19 @@ impl std::fmt::Debug for Settings {
 /// Real env first, then the launcher settings file (`CARRY_LAUNCHER_ENV`, written by
 /// `carry run` for tool launchers whose env has the secrets stripped).
 fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| launcher_env(name))
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| launcher_env(name))
 }
 
 /// Value of `name` in the file named by CARRY_LAUNCHER_ENV. Ignored unless it is a
 /// regular file owned by the current user and not readable by group/other.
 fn launcher_env(name: &str) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    let path = std::env::var("CARRY_LAUNCHER_ENV").ok().filter(|v| !v.is_empty())?;
+    let path = std::env::var("CARRY_LAUNCHER_ENV")
+        .ok()
+        .filter(|v| !v.is_empty())?;
     let md = std::fs::symlink_metadata(&path).ok()?;
     if !md.is_file() || md.uid() != nix::unistd::geteuid().as_raw() || md.mode() & 0o077 != 0 {
         return None;
@@ -174,9 +179,14 @@ fn read_credentials_file(path: &str) -> Result<(Option<String>, Option<String>)>
         if line.starts_with('#') || line.starts_with(';') || line.starts_with('[') {
             continue;
         }
-        let Some(idx) = line.find(['=', ':']) else { continue };
+        let Some(idx) = line.find(['=', ':']) else {
+            continue;
+        };
         let k = line[..idx].trim().to_ascii_lowercase();
-        let v = line[idx + 1..].trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        let v = line[idx + 1..]
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string();
         match k.as_str() {
             "access_key_id" | "aws_access_key_id" => a = Some(v),
             "secret_access_key" | "aws_secret_access_key" => s = Some(v),
@@ -201,7 +211,10 @@ pub fn load_config(path: &Path) -> Result<ConfigFile> {
         Ok(t) => serde_yaml::from_str(&t)
             .map_err(|e| CarryError::Usage(format!("invalid config {}: {e}", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ConfigFile::default()),
-        Err(e) => Err(CarryError::Internal(anyhow!("reading {}: {e}", path.display()))),
+        Err(e) => Err(CarryError::Internal(anyhow!(
+            "reading {}: {e}",
+            path.display()
+        ))),
     }
 }
 
@@ -273,12 +286,22 @@ impl Settings {
 
         Ok(Settings {
             repo: g.repo.clone().or_else(|| env("CARRY_REPO")).or(p.repo),
-            endpoint: g.endpoint.clone().or_else(|| env("CARRY_S3_ENDPOINT")).or(p.endpoint),
-            region: g.region.clone().or_else(|| env("CARRY_S3_REGION")).or(p.region),
+            endpoint: g
+                .endpoint
+                .clone()
+                .or_else(|| env("CARRY_S3_ENDPOINT"))
+                .or(p.endpoint),
+            region: g
+                .region
+                .clone()
+                .or_else(|| env("CARRY_S3_REGION"))
+                .or(p.region),
             access_key_id: ak,
             secret_access_key: sk,
             master_key,
-            root: env("CARRY_ROOT").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT)),
+            root: env("CARRY_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT)),
             state: env("CARRY_STATE"),
             timeout_secs,
             json: g.json,
@@ -295,7 +318,9 @@ impl Settings {
                 .transpose()?
                 .unwrap_or(DEFAULT_RESTORE_BUDGET_MS),
             reload_signal: env("CARRY_RELOAD_SIGNAL"),
-            no_encryption: env("CARRY_NO_ENCRYPTION").map(|v| v == "1" || v == "true").unwrap_or(false),
+            no_encryption: env("CARRY_NO_ENCRYPTION")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false),
         })
     }
 }
@@ -369,10 +394,16 @@ mod tests {
         assert_eq!(s.timeout_secs, DEFAULT_TIMEOUT_SECS);
         assert!(!format!("{s:?}").contains("AKID"));
         g.repo = Some("s3://flag/x".into());
-        assert_eq!(Settings::resolve(&g).unwrap().repo.as_deref(), Some("s3://flag/x"));
+        assert_eq!(
+            Settings::resolve(&g).unwrap().repo.as_deref(),
+            Some("s3://flag/x")
+        );
         std::env::remove_var("CARRY_REPO");
         g.repo = None;
-        assert_eq!(Settings::resolve(&g).unwrap().repo.as_deref(), Some("s3://prof/x"));
+        assert_eq!(
+            Settings::resolve(&g).unwrap().repo.as_deref(),
+            Some("s3://prof/x")
+        );
 
         // Launcher settings file: below real env, above the profile; must be private.
         use std::os::unix::fs::PermissionsExt;
@@ -382,12 +413,21 @@ mod tests {
         std::env::set_var("CARRY_LAUNCHER_ENV", &lf);
         std::env::remove_var("CARRY_KEY");
         let s = Settings::resolve(&g).unwrap();
-        assert_eq!((s.repo.as_deref(), s.master_key.as_deref()), (Some("s3://launcher/x"), Some("lk")));
+        assert_eq!(
+            (s.repo.as_deref(), s.master_key.as_deref()),
+            (Some("s3://launcher/x"), Some("lk"))
+        );
         std::env::set_var("CARRY_REPO", "s3://env/x");
-        assert_eq!(Settings::resolve(&g).unwrap().repo.as_deref(), Some("s3://env/x"));
+        assert_eq!(
+            Settings::resolve(&g).unwrap().repo.as_deref(),
+            Some("s3://env/x")
+        );
         std::env::remove_var("CARRY_REPO");
         std::fs::set_permissions(&lf, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(Settings::resolve(&g).unwrap().repo.as_deref(), Some("s3://prof/x"));
+        assert_eq!(
+            Settings::resolve(&g).unwrap().repo.as_deref(),
+            Some("s3://prof/x")
+        );
         std::env::remove_var("CARRY_LAUNCHER_ENV");
     }
 }

@@ -63,14 +63,22 @@ fn profile_list_use_current() {
 #[test]
 fn readonly_profile_refuses_writes() {
     let (_d, p) = setup();
-    let o = carry(&p, &["--json", "--profile", "prod", "rm", "web:/etc/a"], &[]);
+    let o = carry(
+        &p,
+        &["--json", "--profile", "prod", "rm", "web:/etc/a"],
+        &[],
+    );
     assert_eq!(o.status.code(), Some(2));
     let v = json(&o);
     assert_eq!(v["ok"], false);
     assert_eq!(v["error"]["code"], "readonly");
     assert!(v["error"]["message"].as_str().unwrap().contains("prod"));
     // Human mode: error on stderr, nothing on stdout.
-    let o = carry(&p, &["env", "set", "web", "A=1"], &[("CARRY_PROFILE", "prod")]);
+    let o = carry(
+        &p,
+        &["env", "set", "web", "A=1"],
+        &[("CARRY_PROFILE", "prod")],
+    );
     assert_eq!(o.status.code(), Some(2));
     assert!(o.stdout.is_empty());
     assert!(String::from_utf8_lossy(&o.stderr).contains("read-only"));

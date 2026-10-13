@@ -45,8 +45,9 @@ impl MasterKey {
         B64.encode(self.0)
     }
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
-        let s = std::fs::read_to_string(path)
-            .map_err(|e| CarryError::BadKey(format!("cannot read key file {}: {e}", path.display())))?;
+        let s = std::fs::read_to_string(path).map_err(|e| {
+            CarryError::BadKey(format!("cannot read key file {}: {e}", path.display()))
+        })?;
         Self::from_base64(&s)
     }
     /// `CARRY_KEY` (base64) or `CARRY_KEY_FILE`. Ok(None) when neither is set.
@@ -105,30 +106,47 @@ impl DataKey {
     fn from_raw(key: [u8; 32]) -> Self {
         let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, &key);
         let mut id_key = [0u8; 32];
-        hk.expand(b"carry blob id", &mut id_key).expect("32 bytes is a valid hkdf length");
+        hk.expand(b"carry blob id", &mut id_key)
+            .expect("32 bytes is a valid hkdf length");
         let mut manifest_id_key = [0u8; 32];
-        hk.expand(b"carry manifest id", &mut manifest_id_key).expect("32 bytes is a valid hkdf length");
-        DataKey { key, id_key, manifest_id_key }
+        hk.expand(b"carry manifest id", &mut manifest_id_key)
+            .expect("32 bytes is a valid hkdf length");
+        DataKey {
+            key,
+            id_key,
+            manifest_id_key,
+        }
     }
     pub fn wrap(&self, mk: &MasterKey) -> WrappedKey {
         let sealed = seal_raw(&mk.cipher(), &self.key, b"carry data key v1");
-        WrappedKey { kid: mk.key_id(), data: B64.encode(sealed) }
+        WrappedKey {
+            kid: mk.key_id(),
+            data: B64.encode(sealed),
+        }
     }
     pub fn unwrap(w: &WrappedKey, mk: &MasterKey) -> Result<Self> {
         if w.kid != mk.key_id() {
-            return Err(CarryError::BadKey("master key does not match this repository".into()));
+            return Err(CarryError::BadKey(
+                "master key does not match this repository".into(),
+            ));
         }
-        let raw = B64.decode(&w.data).map_err(|_| CarryError::Invalid("wrapped key not base64".into()))?;
+        let raw = B64
+            .decode(&w.data)
+            .map_err(|_| CarryError::Invalid("wrapped key not base64".into()))?;
         let pt = open_raw(&mk.cipher(), &raw, b"carry data key v1")
             .map_err(|_| CarryError::BadKey("master key does not unwrap the data key".into()))?;
-        let arr: [u8; 32] = pt.try_into().map_err(|_| CarryError::Invalid("bad data key length".into()))?;
+        let arr: [u8; 32] = pt
+            .try_into()
+            .map_err(|_| CarryError::Invalid("bad data key length".into()))?;
         Ok(Self::from_raw(arr))
     }
     /// Unwrap with whichever record matches `mk`.
     pub fn unwrap_any(ws: &[WrappedKey], mk: &MasterKey) -> Result<Self> {
         match ws.iter().find(|w| w.kid == mk.key_id()) {
             Some(w) => Self::unwrap(w, mk),
-            None => Err(CarryError::BadKey("master key does not match this repository".into())),
+            None => Err(CarryError::BadKey(
+                "master key does not match this repository".into(),
+            )),
         }
     }
     fn cipher(&self) -> XChaCha20Poly1305 {
@@ -140,7 +158,10 @@ fn seal_raw(c: &XChaCha20Poly1305, pt: &[u8], aad: &[u8]) -> Vec<u8> {
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
     let ct = c
-        .encrypt(XNonce::from_slice(&nonce), chacha20poly1305::aead::Payload { msg: pt, aad })
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            chacha20poly1305::aead::Payload { msg: pt, aad },
+        )
         .expect("xchacha encrypt cannot fail");
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce);
@@ -153,8 +174,11 @@ fn open_raw(c: &XChaCha20Poly1305, data: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         return Err(CarryError::Invalid("ciphertext too short".into()));
     }
     let (n, ct) = data.split_at(NONCE_LEN);
-    c.decrypt(XNonce::from_slice(n), chacha20poly1305::aead::Payload { msg: ct, aad })
-        .map_err(|_| CarryError::Invalid("authentication tag mismatch".into()))
+    c.decrypt(
+        XNonce::from_slice(n),
+        chacha20poly1305::aead::Payload { msg: ct, aad },
+    )
+    .map_err(|_| CarryError::Invalid("authentication tag mismatch".into()))
 }
 
 /// Encryption mode of a repository, chosen by its `config`.
@@ -214,7 +238,9 @@ impl Cipher {
     /// Keyed id for a manifest (label "carry manifest id"), distinct from any blob id.
     pub fn manifest_id(&self, json: &[u8]) -> String {
         match self {
-            Cipher::Encrypted(k) => blake3::keyed_hash(&k.manifest_id_key, json).to_hex().to_string(),
+            Cipher::Encrypted(k) => blake3::keyed_hash(&k.manifest_id_key, json)
+                .to_hex()
+                .to_string(),
             Cipher::None => {
                 let mut h = blake3::Hasher::new_derive_key("carry manifest id v2");
                 h.update(json);
@@ -227,7 +253,9 @@ impl Cipher {
         let z = compress(json)?;
         let mut out = vec![FMT_MANIFEST_V2];
         match self {
-            Cipher::Encrypted(k) => out.extend_from_slice(&seal_raw(&k.cipher(), &z, &manifest_aad(state))),
+            Cipher::Encrypted(k) => {
+                out.extend_from_slice(&seal_raw(&k.cipher(), &z, &manifest_aad(state)))
+            }
             Cipher::None => out.extend_from_slice(&z),
         }
         Ok(out)
@@ -237,7 +265,8 @@ impl Cipher {
     pub fn open_manifest(&self, data: &[u8], state: &str) -> Result<(Vec<u8>, bool)> {
         if data.first() == Some(&FMT_MANIFEST_V2) {
             let r = match self {
-                Cipher::Encrypted(k) => open_raw(&k.cipher(), &data[1..], &manifest_aad(state)).and_then(|z| decompress(&z)),
+                Cipher::Encrypted(k) => open_raw(&k.cipher(), &data[1..], &manifest_aad(state))
+                    .and_then(|z| decompress(&z)),
                 Cipher::None => decompress(&data[1..]),
             };
             if let Ok(j) = r {
@@ -311,11 +340,16 @@ impl ChunkEncoder {
     /// One frame (header + payload). `last` must be true for exactly the final chunk.
     pub fn frame(&mut self, chunk: &[u8], last: bool) -> Result<Vec<u8>> {
         if self.done {
-            return Err(CarryError::Internal(anyhow::anyhow!("chunk after final chunk")));
+            return Err(CarryError::Internal(anyhow::anyhow!(
+                "chunk after final chunk"
+            )));
         }
         let z = compress(chunk)?;
         let payload = if self.encrypted {
-            let p = chacha20poly1305::aead::Payload { msg: &z, aad: STREAM_AAD };
+            let p = chacha20poly1305::aead::Payload {
+                msg: &z,
+                aad: STREAM_AAD,
+            };
             let r = if last {
                 self.done = true;
                 self.enc.take().expect("encoder present").encrypt_last(p)
@@ -351,7 +385,10 @@ impl ChunkDecoder {
             return Err(CarryError::Invalid("data after final chunk".into()));
         }
         let z = if self.encrypted {
-            let p = chacha20poly1305::aead::Payload { msg: payload, aad: STREAM_AAD };
+            let p = chacha20poly1305::aead::Payload {
+                msg: payload,
+                aad: STREAM_AAD,
+            };
             let r = if last {
                 self.done = true;
                 self.dec.take().expect("decoder present").decrypt_last(p)
@@ -372,7 +409,9 @@ pub fn frame_header(h: [u8; 4]) -> Result<(usize, bool)> {
     let v = u32::from_be_bytes(h);
     let len = (v & !FRAME_LAST) as usize;
     if len > FRAME_MAX {
-        return Err(CarryError::Invalid(format!("chunk frame too large ({len} bytes)")));
+        return Err(CarryError::Invalid(format!(
+            "chunk frame too large ({len} bytes)"
+        )));
     }
     Ok((len, v & FRAME_LAST != 0))
 }
@@ -387,7 +426,11 @@ impl Cipher {
     }
     /// Length of the chunked-format header after the format byte.
     pub fn stream_prefix_len(&self) -> usize {
-        if self.is_encrypted() { STREAM_PREFIX_LEN } else { 0 }
+        if self.is_encrypted() {
+            STREAM_PREFIX_LEN
+        } else {
+            0
+        }
     }
     /// (header bytes incl. format byte, encoder).
     pub fn chunk_encoder(&self) -> (Vec<u8>, ChunkEncoder) {
@@ -398,21 +441,44 @@ impl Cipher {
                 rand::thread_rng().fill_bytes(&mut prefix);
                 hdr.extend_from_slice(&prefix);
                 let enc = StreamEnc::from_aead(k.cipher(), (&prefix).into());
-                (hdr, ChunkEncoder { enc: Some(enc), encrypted: true, done: false })
+                (
+                    hdr,
+                    ChunkEncoder {
+                        enc: Some(enc),
+                        encrypted: true,
+                        done: false,
+                    },
+                )
             }
-            Cipher::None => (hdr, ChunkEncoder { enc: None, encrypted: false, done: false }),
+            Cipher::None => (
+                hdr,
+                ChunkEncoder {
+                    enc: None,
+                    encrypted: false,
+                    done: false,
+                },
+            ),
         }
     }
     /// Decoder for a chunked blob; `prefix` is the header after the format byte.
     pub fn chunk_decoder(&self, prefix: &[u8]) -> Result<ChunkDecoder> {
         match self {
             Cipher::Encrypted(k) => {
-                let arr: [u8; STREAM_PREFIX_LEN] =
-                    prefix.try_into().map_err(|_| CarryError::Invalid("bad chunked blob header".into()))?;
+                let arr: [u8; STREAM_PREFIX_LEN] = prefix
+                    .try_into()
+                    .map_err(|_| CarryError::Invalid("bad chunked blob header".into()))?;
                 let dec = StreamDec::from_aead(k.cipher(), (&arr).into());
-                Ok(ChunkDecoder { dec: Some(dec), encrypted: true, done: false })
+                Ok(ChunkDecoder {
+                    dec: Some(dec),
+                    encrypted: true,
+                    done: false,
+                })
             }
-            Cipher::None => Ok(ChunkDecoder { dec: None, encrypted: false, done: false }),
+            Cipher::None => Ok(ChunkDecoder {
+                dec: None,
+                encrypted: false,
+                done: false,
+            }),
         }
     }
     /// Whole blob object for an in-memory plaintext (single-shot or chunked by size).
@@ -421,7 +487,9 @@ impl Cipher {
             let z = compress(pt)?;
             let mut out = vec![FMT_SINGLE_V2];
             match self {
-                Cipher::Encrypted(k) => out.extend_from_slice(&seal_raw(&k.cipher(), &z, BLOB_AAD_V2)),
+                Cipher::Encrypted(k) => {
+                    out.extend_from_slice(&seal_raw(&k.cipher(), &z, BLOB_AAD_V2))
+                }
                 Cipher::None => out.extend_from_slice(&z),
             }
             return Ok(out);
@@ -437,7 +505,9 @@ impl Cipher {
     pub fn decode_single(&self, data: &[u8]) -> Result<Vec<u8>> {
         if data.first() == Some(&FMT_SINGLE_V2) {
             let r = match self {
-                Cipher::Encrypted(k) => open_raw(&k.cipher(), &data[1..], BLOB_AAD_V2).and_then(|z| decompress(&z)),
+                Cipher::Encrypted(k) => {
+                    open_raw(&k.cipher(), &data[1..], BLOB_AAD_V2).and_then(|z| decompress(&z))
+                }
                 Cipher::None => decompress(&data[1..]),
             };
             if let Ok(v) = r {
@@ -458,7 +528,10 @@ impl Cipher {
 /// Returns (secret key base64 [32-byte seed], public key base64).
 pub fn ed25519_keygen() -> (String, String) {
     let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    (B64.encode(sk.to_bytes()), B64.encode(sk.verifying_key().to_bytes()))
+    (
+        B64.encode(sk.to_bytes()),
+        B64.encode(sk.verifying_key().to_bytes()),
+    )
 }
 
 pub fn ed25519_public(secret_b64: &str) -> Result<String> {
@@ -466,8 +539,12 @@ pub fn ed25519_public(secret_b64: &str) -> Result<String> {
 }
 
 fn signing_key(secret_b64: &str) -> Result<ed25519_dalek::SigningKey> {
-    let raw = B64.decode(secret_b64.trim()).map_err(|_| CarryError::BadKey("signing key not base64".into()))?;
-    let arr: [u8; 32] = raw.try_into().map_err(|_| CarryError::BadKey("signing key must be 32 bytes".into()))?;
+    let raw = B64
+        .decode(secret_b64.trim())
+        .map_err(|_| CarryError::BadKey("signing key not base64".into()))?;
+    let arr: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| CarryError::BadKey("signing key must be 32 bytes".into()))?;
     Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
 }
 
@@ -480,12 +557,21 @@ pub fn sign(secret_b64: &str, msg: &[u8]) -> Result<String> {
 /// Err(Invalid) if the signature does not verify.
 pub fn verify(public_b64: &str, msg: &[u8], sig_b64: &str) -> Result<()> {
     use ed25519_dalek::Verifier;
-    let pk = B64.decode(public_b64.trim()).map_err(|_| CarryError::Invalid("public key not base64".into()))?;
-    let pk: [u8; 32] = pk.try_into().map_err(|_| CarryError::Invalid("public key must be 32 bytes".into()))?;
-    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).map_err(|_| CarryError::Invalid("bad public key".into()))?;
-    let sig = B64.decode(sig_b64.trim()).map_err(|_| CarryError::Invalid("signature not base64".into()))?;
-    let sig = ed25519_dalek::Signature::from_slice(&sig).map_err(|_| CarryError::Invalid("bad signature".into()))?;
-    vk.verify(msg, &sig).map_err(|_| CarryError::Invalid("signature does not verify".into()))
+    let pk = B64
+        .decode(public_b64.trim())
+        .map_err(|_| CarryError::Invalid("public key not base64".into()))?;
+    let pk: [u8; 32] = pk
+        .try_into()
+        .map_err(|_| CarryError::Invalid("public key must be 32 bytes".into()))?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk)
+        .map_err(|_| CarryError::Invalid("bad public key".into()))?;
+    let sig = B64
+        .decode(sig_b64.trim())
+        .map_err(|_| CarryError::Invalid("signature not base64".into()))?;
+    let sig = ed25519_dalek::Signature::from_slice(&sig)
+        .map_err(|_| CarryError::Invalid("bad signature".into()))?;
+    vk.verify(msg, &sig)
+        .map_err(|_| CarryError::Invalid("signature does not verify".into()))
 }
 
 #[cfg(test)]
@@ -510,11 +596,17 @@ mod tests {
         let back = DataKey::unwrap(&w, &mk2).unwrap();
         assert_eq!(blob_id(&dk, b"a"), blob_id(&back, b"a"));
         let other = MasterKey::generate();
-        assert!(matches!(DataKey::unwrap(&w, &other), Err(CarryError::BadKey(_))));
+        assert!(matches!(
+            DataKey::unwrap(&w, &other),
+            Err(CarryError::BadKey(_))
+        ));
         // forged kid still fails at the AEAD layer
         let mut forged = w.clone();
         forged.kid = other.key_id();
-        assert!(matches!(DataKey::unwrap(&forged, &other), Err(CarryError::BadKey(_))));
+        assert!(matches!(
+            DataKey::unwrap(&forged, &other),
+            Err(CarryError::BadKey(_))
+        ));
     }
 
     #[test]
@@ -524,7 +616,10 @@ mod tests {
         let last = ct.len() - 1;
         ct[last] ^= 1;
         assert!(matches!(open(&dk, &ct), Err(CarryError::Invalid(_))));
-        assert!(matches!(open(&DataKey::generate(), &seal(&dk, b"s")), Err(CarryError::Invalid(_))));
+        assert!(matches!(
+            open(&DataKey::generate(), &seal(&dk, b"s")),
+            Err(CarryError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -550,7 +645,10 @@ mod tests {
         assert!(c.open_manifest(&b, "web-1").is_err());
         // Legacy objects still open.
         let legacy = c.compress_seal(json).unwrap();
-        assert_eq!(c.open_manifest(&legacy, "web-1").unwrap(), (json.to_vec(), false));
+        assert_eq!(
+            c.open_manifest(&legacy, "web-1").unwrap(),
+            (json.to_vec(), false)
+        );
         let mut lb = vec![FMT_SINGLE];
         lb.extend_from_slice(&legacy);
         assert_eq!(c.decode_single(&lb).unwrap(), json);

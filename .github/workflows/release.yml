@@ -6,16 +6,37 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   image:
     runs-on: ubuntu-latest
+    env:
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
       - id: ver
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - id: tags
+        run: |
+          {
+            echo "list<<EOF"
+            echo "ghcr.io/muthuishere/carry:${{ steps.ver.outputs.version }}"
+            echo "ghcr.io/muthuishere/carry:latest"
+            if [ "$HAS_DOCKERHUB" = "true" ]; then
+              echo "docker.io/muthuishere/carry:${{ steps.ver.outputs.version }}"
+              echo "docker.io/muthuishere/carry:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - if: env.HAS_DOCKERHUB == 'true'
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -24,9 +45,11 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            docker.io/$EMAIL_2/carry:${{ steps.ver.outputs.version }}
-            docker.io/$EMAIL_2/carry:latest
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/muthuishere/carry
+            org.opencontainers.image.description=Your container's tools and config, from any S3 bucket
+            org.opencontainers.image.licenses=Apache-2.0
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

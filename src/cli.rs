@@ -10,7 +10,11 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 
 #[derive(Debug, Parser)]
-#[command(name = "carry", version, about = "Your container's tools and config, from any S3 bucket")]
+#[command(
+    name = "carry",
+    version,
+    about = "Your container's tools and config, from any S3 bucket"
+)]
 pub struct Cli {
     #[command(flatten)]
     pub global: GlobalArgs,
@@ -55,7 +59,10 @@ pub enum Command {
         mode: Option<String>,
     },
     /// Download <state:path> to stdout or a file
-    Get { target: String, dest: Option<String> },
+    Get {
+        target: String,
+        dest: Option<String>,
+    },
     /// List <state>[:<dir>]
     Ls { target: String },
     /// Remove <state:path>
@@ -104,8 +111,14 @@ pub enum EnvCmd {
         #[arg(required = true)]
         keys: Vec<String>,
     },
-    Import { state: String, file: String },
-    Get { state: String, key: Option<String> },
+    Import {
+        state: String,
+        file: String,
+    },
+    Get {
+        state: String,
+        key: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -128,8 +141,12 @@ pub enum ToolCmd {
         #[arg(long)]
         channel: String,
     },
-    Yank { spec: String },
-    Ls { name: Option<String> },
+    Yank {
+        spec: String,
+    },
+    Ls {
+        name: Option<String>,
+    },
     Add {
         state: String,
         /// name[@version]
@@ -141,7 +158,10 @@ pub enum ToolCmd {
         #[arg(long)]
         required: bool,
     },
-    Rm { state: String, name: String },
+    Rm {
+        state: String,
+        name: String,
+    },
     Keygen {
         /// Where to write the private key (default ~/.config/carry/tool-signing.key)
         #[arg(long)]
@@ -223,7 +243,9 @@ fn parse_spec(s: &str, optional: bool) -> Result<(String, Option<String>)> {
     match s.split_once('@') {
         Some((n, v)) if !n.is_empty() && !v.is_empty() => Ok((n.into(), Some(v.into()))),
         None if optional && !s.is_empty() => Ok((s.into(), None)),
-        _ => Err(CarryError::Usage(format!("expected name@version, got '{s}'"))),
+        _ => Err(CarryError::Usage(format!(
+            "expected name@version, got '{s}'"
+        ))),
     }
 }
 
@@ -273,7 +295,14 @@ fn render_human(v: &Value) -> String {
                 let widths: Vec<usize> = cols
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| cells.iter().map(|r| r[i].len()).max().unwrap_or(0).max(c.len()))
+                    .map(|(i, c)| {
+                        cells
+                            .iter()
+                            .map(|r| r[i].len())
+                            .max()
+                            .unwrap_or(0)
+                            .max(c.len())
+                    })
                     .collect();
                 s.push_str(&format!("{k}:\n"));
                 let line = |r: &[String]| {
@@ -307,7 +336,10 @@ fn render_human(v: &Value) -> String {
 
 pub fn main() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
-    let json_hint = argv.iter().take_while(|a| *a != "--").any(|a| a == "--json");
+    let json_hint = argv
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "--json");
     let cli = match Cli::try_parse_from(&argv) {
         Ok(c) => c,
         Err(e) => {
@@ -318,7 +350,10 @@ pub fn main() -> i32 {
             }
             if json_hint {
                 let msg = e.kind().to_string();
-                emit_err(true, &CarryError::Usage(format!("{msg}: {}", first_line(&e.to_string()))));
+                emit_err(
+                    true,
+                    &CarryError::Usage(format!("{msg}: {}", first_line(&e.to_string()))),
+                );
             } else {
                 let _ = e.print();
             }
@@ -327,10 +362,16 @@ pub fn main() -> i32 {
     };
     let json_mode = cli.global.json;
 
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
-            emit_err(json_mode, &CarryError::Internal(anyhow!("tokio runtime: {e}")));
+            emit_err(
+                json_mode,
+                &CarryError::Internal(anyhow!("tokio runtime: {e}")),
+            );
             return 1;
         }
     };
@@ -351,7 +392,11 @@ pub fn main() -> i32 {
 }
 
 fn first_line(s: &str) -> String {
-    s.lines().next().unwrap_or("").trim_start_matches("error: ").to_string()
+    s.lines()
+        .next()
+        .unwrap_or("")
+        .trim_start_matches("error: ")
+        .to_string()
 }
 
 enum Outcome {
@@ -372,7 +417,9 @@ async fn dispatch(cli: Cli) -> Result<Outcome> {
                 json!({"current": current, "profiles": profiles})
             }
             ProfileCmd::Use { name } => json!({"current": settings::profile_use(name)?}),
-            ProfileCmd::Current => json!({"current": settings::profile_current(g.profile.as_deref())?}),
+            ProfileCmd::Current => {
+                json!({"current": settings::profile_current(g.profile.as_deref())?})
+            }
         }));
     }
 
@@ -384,13 +431,20 @@ async fn dispatch(cli: Cli) -> Result<Outcome> {
     let v = match cli.cmd {
         Command::Init => adapter::init(&s).await?,
         Command::Doctor => adapter::doctor(&s).await?,
-        Command::Put { target, source, mode: mode_flag } => {
+        Command::Put {
+            target,
+            source,
+            mode: mode_flag,
+        } => {
             let (state, path) = parse_state_path(&target)?;
             let mode_flag = match mode_flag {
-                Some(m) => Some(
-                    u32::from_str_radix(m.trim_start_matches("0o"), 8)
-                        .map_err(|_| CarryError::Usage(format!("invalid --mode '{m}' (expected octal like 0644)")))?,
-                ),
+                Some(m) => Some(u32::from_str_radix(m.trim_start_matches("0o"), 8).map_err(
+                    |_| {
+                        CarryError::Usage(format!(
+                            "invalid --mode '{m}' (expected octal like 0644)"
+                        ))
+                    },
+                )?),
                 None => None,
             };
             if source == "-" {
@@ -473,7 +527,13 @@ async fn dispatch(cli: Cli) -> Result<Outcome> {
         Command::Status => adapter::status(&s).await?,
         Command::Run { cmd } => return Ok(Outcome::Exit(adapter::run(&s, cmd).await)),
         Command::Tool(t) => match t {
-            ToolCmd::Publish { spec, file, url, sha256, platform } => {
+            ToolCmd::Publish {
+                spec,
+                file,
+                url,
+                sha256,
+                platform,
+            } => {
                 let (name, ver) = parse_spec(&spec, false)?;
                 let src = match (file, url) {
                     (Some(f), _) => ToolSource::File(f.into()),
@@ -491,9 +551,20 @@ async fn dispatch(cli: Cli) -> Result<Outcome> {
                 adapter::tool_yank(&s, &name, &ver.unwrap()).await?
             }
             ToolCmd::Ls { name } => adapter::tool_ls(&s, name.as_deref()).await?,
-            ToolCmd::Add { state, spec, channel, prefetch, required } => {
+            ToolCmd::Add {
+                state,
+                spec,
+                channel,
+                prefetch,
+                required,
+            } => {
                 let (name, version) = parse_spec(&spec, true)?;
-                let r = crate::model::ToolRef { version, channel, prefetch, required };
+                let r = crate::model::ToolRef {
+                    version,
+                    channel,
+                    prefetch,
+                    required,
+                };
                 adapter::tool_add(&s, &state, &name, r).await?
             }
             ToolCmd::Rm { state, name } => adapter::tool_rm(&s, &state, &name).await?,
@@ -520,7 +591,9 @@ fn read_source(src: &str) -> Result<(Vec<u8>, u32)> {
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(src).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o644)
+        std::fs::metadata(src)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0o644)
     };
     #[cfg(not(unix))]
     let mode = 0o644;
@@ -534,7 +607,8 @@ fn write_dest(dest: Option<&str>, bytes: &[u8], mode: u32) -> Result<()> {
             .write_all(bytes)
             .map_err(|e| CarryError::Internal(anyhow!("writing stdout: {e}"))),
         Some(p) => {
-            std::fs::write(p, bytes).map_err(|e| CarryError::Usage(format!("cannot write {p}: {e}")))?;
+            std::fs::write(p, bytes)
+                .map_err(|e| CarryError::Usage(format!("cannot write {p}: {e}")))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -599,30 +673,90 @@ mod adapter {
         Err(CarryError::Internal(anyhow!("not implemented: {cmd}")))
     }
 
-    pub async fn init(s: &Settings) -> Result<Value> { crate::ops::init(s).await }
-    pub async fn doctor(s: &Settings) -> Result<Value> { crate::ops::doctor(s).await }
-    pub async fn put(s: &Settings, state: &str, path: &str, bytes: Vec<u8>, mode: u32) -> Result<Value> { crate::ops::put(s, state, path, bytes, mode).await }
-    pub async fn get(s: &Settings, state: &str, path: &str) -> Result<GetOutput> { crate::ops::get(s, state, path).await }
-    pub async fn ls(s: &Settings, state: &str, dir: Option<&str>) -> Result<Value> { crate::ops::ls(s, state, dir).await }
-    pub async fn rm(s: &Settings, state: &str, path: &str) -> Result<Value> { crate::ops::rm(s, state, path).await }
-    pub async fn mv(s: &Settings, state: &str, from: &str, to: &str) -> Result<Value> { crate::ops::mv(s, state, from, to).await }
-    pub async fn log(s: &Settings, state: &str, limit: Option<usize>) -> Result<Value> { crate::ops::log(s, state, limit).await }
-    pub async fn diff(s: &Settings, state: &str, v1: u64, v2: u64) -> Result<Value> { crate::ops::diff(s, state, v1, v2).await }
-    pub async fn rollback(s: &Settings, state: &str, version: u64) -> Result<Value> { crate::ops::rollback(s, state, version).await }
-    pub async fn env_set(s: &Settings, state: &str, kv: Vec<(String, String)>) -> Result<Value> { crate::ops::env_set(s, state, kv).await }
-    pub async fn env_unset(s: &Settings, state: &str, keys: Vec<String>) -> Result<Value> { crate::ops::env_unset(s, state, keys).await }
-    pub async fn env_import(s: &Settings, state: &str, text: &str) -> Result<Value> { crate::ops::env_import(s, state, text).await }
-    pub async fn env_get(s: &Settings, state: &str, key: Option<&str>) -> Result<Value> { crate::ops::env_get(s, state, key).await }
-    pub async fn states(s: &Settings) -> Result<Value> { crate::ops::states(s).await }
-    pub async fn status(s: &Settings) -> Result<Value> { crate::restore::status(s).await }
-    pub async fn run(s: &Settings, cmd: Vec<String>) -> i32 { crate::run::run(s, cmd).await }
-    pub async fn tool_publish(s: &Settings, name: &str, ver: &str, src: ToolSource, platform: &str) -> Result<Value> { crate::tools::publish(s, name, ver, src, platform).await }
-    pub async fn tool_promote(s: &Settings, name: &str, ver: &str, channel: &str) -> Result<Value> { crate::tools::promote(s, name, ver, channel).await }
-    pub async fn tool_yank(s: &Settings, name: &str, ver: &str) -> Result<Value> { crate::tools::yank(s, name, ver).await }
-    pub async fn tool_ls(s: &Settings, name: Option<&str>) -> Result<Value> { crate::tools::ls(s, name).await }
-    pub async fn tool_add(s: &Settings, state: &str, name: &str, r: ToolRef) -> Result<Value> { crate::tools::add(s, state, name, r).await }
-    pub async fn tool_rm(s: &Settings, state: &str, name: &str) -> Result<Value> { crate::tools::rm(s, state, name).await }
-    pub async fn tool_keygen(s: &Settings, out: Option<&std::path::Path>) -> Result<Value> { crate::tools::keygen(s, out).await }
+    pub async fn init(s: &Settings) -> Result<Value> {
+        crate::ops::init(s).await
+    }
+    pub async fn doctor(s: &Settings) -> Result<Value> {
+        crate::ops::doctor(s).await
+    }
+    pub async fn put(
+        s: &Settings,
+        state: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        mode: u32,
+    ) -> Result<Value> {
+        crate::ops::put(s, state, path, bytes, mode).await
+    }
+    pub async fn get(s: &Settings, state: &str, path: &str) -> Result<GetOutput> {
+        crate::ops::get(s, state, path).await
+    }
+    pub async fn ls(s: &Settings, state: &str, dir: Option<&str>) -> Result<Value> {
+        crate::ops::ls(s, state, dir).await
+    }
+    pub async fn rm(s: &Settings, state: &str, path: &str) -> Result<Value> {
+        crate::ops::rm(s, state, path).await
+    }
+    pub async fn mv(s: &Settings, state: &str, from: &str, to: &str) -> Result<Value> {
+        crate::ops::mv(s, state, from, to).await
+    }
+    pub async fn log(s: &Settings, state: &str, limit: Option<usize>) -> Result<Value> {
+        crate::ops::log(s, state, limit).await
+    }
+    pub async fn diff(s: &Settings, state: &str, v1: u64, v2: u64) -> Result<Value> {
+        crate::ops::diff(s, state, v1, v2).await
+    }
+    pub async fn rollback(s: &Settings, state: &str, version: u64) -> Result<Value> {
+        crate::ops::rollback(s, state, version).await
+    }
+    pub async fn env_set(s: &Settings, state: &str, kv: Vec<(String, String)>) -> Result<Value> {
+        crate::ops::env_set(s, state, kv).await
+    }
+    pub async fn env_unset(s: &Settings, state: &str, keys: Vec<String>) -> Result<Value> {
+        crate::ops::env_unset(s, state, keys).await
+    }
+    pub async fn env_import(s: &Settings, state: &str, text: &str) -> Result<Value> {
+        crate::ops::env_import(s, state, text).await
+    }
+    pub async fn env_get(s: &Settings, state: &str, key: Option<&str>) -> Result<Value> {
+        crate::ops::env_get(s, state, key).await
+    }
+    pub async fn states(s: &Settings) -> Result<Value> {
+        crate::ops::states(s).await
+    }
+    pub async fn status(s: &Settings) -> Result<Value> {
+        crate::restore::status(s).await
+    }
+    pub async fn run(s: &Settings, cmd: Vec<String>) -> i32 {
+        crate::run::run(s, cmd).await
+    }
+    pub async fn tool_publish(
+        s: &Settings,
+        name: &str,
+        ver: &str,
+        src: ToolSource,
+        platform: &str,
+    ) -> Result<Value> {
+        crate::tools::publish(s, name, ver, src, platform).await
+    }
+    pub async fn tool_promote(s: &Settings, name: &str, ver: &str, channel: &str) -> Result<Value> {
+        crate::tools::promote(s, name, ver, channel).await
+    }
+    pub async fn tool_yank(s: &Settings, name: &str, ver: &str) -> Result<Value> {
+        crate::tools::yank(s, name, ver).await
+    }
+    pub async fn tool_ls(s: &Settings, name: Option<&str>) -> Result<Value> {
+        crate::tools::ls(s, name).await
+    }
+    pub async fn tool_add(s: &Settings, state: &str, name: &str, r: ToolRef) -> Result<Value> {
+        crate::tools::add(s, state, name, r).await
+    }
+    pub async fn tool_rm(s: &Settings, state: &str, name: &str) -> Result<Value> {
+        crate::tools::rm(s, state, name).await
+    }
+    pub async fn tool_keygen(s: &Settings, out: Option<&std::path::Path>) -> Result<Value> {
+        crate::tools::keygen(s, out).await
+    }
 }
 
 #[cfg(test)]
@@ -631,12 +765,18 @@ mod tests {
 
     #[test]
     fn state_path() {
-        assert_eq!(parse_state_path("web-1:/etc/a").unwrap(), ("web-1".into(), "/etc/a".into()));
+        assert_eq!(
+            parse_state_path("web-1:/etc/a").unwrap(),
+            ("web-1".into(), "/etc/a".into())
+        );
         assert!(parse_state_path("web-1").is_err());
         assert!(parse_state_path("web-1:rel").is_err());
         assert!(parse_state_path(":/x").is_err());
         assert_eq!(parse_state_dir("w").unwrap(), ("w".into(), None));
-        assert_eq!(parse_spec("jq@1.7", false).unwrap(), ("jq".into(), Some("1.7".into())));
+        assert_eq!(
+            parse_spec("jq@1.7", false).unwrap(),
+            ("jq".into(), Some("1.7".into()))
+        );
         assert!(parse_spec("jq", false).is_err());
         assert_eq!(parse_spec("jq", true).unwrap(), ("jq".into(), None));
     }

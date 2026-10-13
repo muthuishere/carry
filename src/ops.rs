@@ -18,9 +18,15 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STA
 pub fn check_state(state: &str) -> Result<()> {
     let ok = !state.is_empty()
         && state.len() <= 128
-        && state.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        && state
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
         && !state.starts_with('.');
-    if ok { Ok(()) } else { Err(CarryError::Usage(format!("invalid state name '{state}'"))) }
+    if ok {
+        Ok(())
+    } else {
+        Err(CarryError::Usage(format!("invalid state name '{state}'")))
+    }
 }
 
 /// Absolute, normalised: starts with '/', no empty, '.' or '..' components, not '/'.
@@ -30,7 +36,10 @@ pub fn check_path(path: &str) -> Result<()> {
     if rest.is_empty() || path.contains('\0') {
         return Err(bad());
     }
-    if rest.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+    if rest
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == "..")
+    {
         return Err(bad());
     }
     Ok(())
@@ -38,9 +47,15 @@ pub fn check_path(path: &str) -> Result<()> {
 
 fn check_env_key(k: &str) -> Result<()> {
     let mut cs = k.chars();
-    let ok = cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    let ok = cs
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && cs.all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if ok { Ok(()) } else { Err(CarryError::Usage(format!("invalid env var name '{k}'"))) }
+    if ok {
+        Ok(())
+    } else {
+        Err(CarryError::Usage(format!("invalid env var name '{k}'")))
+    }
 }
 
 fn not_found_state(state: &str) -> CarryError {
@@ -75,10 +90,17 @@ pub async fn doctor(s: &Settings) -> Result<Value> {
         match doctor_conditional_writes(&store).await {
             Ok(r) => {
                 conditional = r.if_none_match && r.if_match;
-                let detail = if r.detail.is_empty() { "If-None-Match and If-Match honoured".into() } else { r.detail.join("; ") };
-                checks.push(json!({"name": "conditional_writes", "ok": conditional, "detail": detail}));
+                let detail = if r.detail.is_empty() {
+                    "If-None-Match and If-Match honoured".into()
+                } else {
+                    r.detail.join("; ")
+                };
+                checks.push(
+                    json!({"name": "conditional_writes", "ok": conditional, "detail": detail}),
+                );
             }
-            Err(e) => checks.push(json!({"name": "conditional_writes", "ok": false, "detail": e.to_string()})),
+            Err(e) => checks
+                .push(json!({"name": "conditional_writes", "ok": false, "detail": e.to_string()})),
         }
         match config {
             None => checks.push(json!({"name": "initialised", "ok": false, "detail": "no repository config; run `carry init`"})),
@@ -96,7 +118,9 @@ pub async fn doctor(s: &Settings) -> Result<Value> {
             }
         }
     }
-    Ok(json!({"reachable": reachable, "conditional_writes": conditional, "encrypted": encrypted, "checks": checks}))
+    Ok(
+        json!({"reachable": reachable, "conditional_writes": conditional, "encrypted": encrypted, "checks": checks}),
+    )
 }
 
 pub async fn states(s: &Settings) -> Result<Value> {
@@ -115,42 +139,94 @@ pub async fn states_in(repo: &Repo) -> Result<Value> {
 
 // ---------------------------------------------------------------- files
 
-pub async fn put(s: &Settings, state: &str, path: &str, bytes: Vec<u8>, mode: u32) -> Result<Value> {
+pub async fn put(
+    s: &Settings,
+    state: &str,
+    path: &str,
+    bytes: Vec<u8>,
+    mode: u32,
+) -> Result<Value> {
     check_state(state)?;
     check_path(path)?;
     put_in(&open_repo_for_write(s).await?, state, path, bytes, mode).await
 }
 
-pub async fn put_in(repo: &Repo, state: &str, path: &str, bytes: Vec<u8>, mode: u32) -> Result<Value> {
+pub async fn put_in(
+    repo: &Repo,
+    state: &str,
+    path: &str,
+    bytes: Vec<u8>,
+    mode: u32,
+) -> Result<Value> {
     check_state(state)?;
     check_path(path)?;
     let size = bytes.len() as u64;
     let (entry, uploaded) = if bytes.len() < INLINE_MAX {
-        (Entry { kind: EntryKind::File, mode, size, blob: None, inline: Some(B64.encode(&bytes)), target: None }, false)
+        (
+            Entry {
+                kind: EntryKind::File,
+                mode,
+                size,
+                blob: None,
+                inline: Some(B64.encode(&bytes)),
+                target: None,
+            },
+            false,
+        )
     } else {
         let (id, up) = repo.put_blob_report(&bytes).await?;
-        (Entry { kind: EntryKind::File, mode, size, blob: Some(id), inline: None, target: None }, up)
+        (
+            Entry {
+                kind: EntryKind::File,
+                mode,
+                size,
+                blob: Some(id),
+                inline: None,
+                target: None,
+            },
+            up,
+        )
     };
-    let head = mutate(repo, state, "put", vec![path.to_string()], |mut m: Manifest| {
-        let e = entry.clone();
-        async move {
-            m.entries.insert(path.to_string(), e);
-            Ok(m)
-        }
-    })
+    let head = mutate(
+        repo,
+        state,
+        "put",
+        vec![path.to_string()],
+        |mut m: Manifest| {
+            let e = entry.clone();
+            async move {
+                m.entries.insert(path.to_string(), e);
+                Ok(m)
+            }
+        },
+    )
     .await?;
-    Ok(json!({"state": state, "path": path, "version": head.seq, "size": size, "uploaded": uploaded}))
+    Ok(
+        json!({"state": state, "path": path, "version": head.seq, "size": size, "uploaded": uploaded}),
+    )
 }
 
 /// `put` from a file on disk. Large files stream (hash pass + bounded chunked upload)
 /// instead of being read into memory.
-pub async fn put_file(s: &Settings, state: &str, path: &str, file: &std::path::Path, mode: u32) -> Result<Value> {
+pub async fn put_file(
+    s: &Settings,
+    state: &str,
+    path: &str,
+    file: &std::path::Path,
+    mode: u32,
+) -> Result<Value> {
     check_state(state)?;
     check_path(path)?;
     put_file_in(&open_repo_for_write(s).await?, state, path, file, mode).await
 }
 
-pub async fn put_file_in(repo: &Repo, state: &str, path: &str, file: &std::path::Path, mode: u32) -> Result<Value> {
+pub async fn put_file_in(
+    repo: &Repo,
+    state: &str,
+    path: &str,
+    file: &std::path::Path,
+    mode: u32,
+) -> Result<Value> {
     check_state(state)?;
     check_path(path)?;
     let ue = |e: std::io::Error| match e.kind() {
@@ -164,16 +240,31 @@ pub async fn put_file_in(repo: &Repo, state: &str, path: &str, file: &std::path:
         return put_in(repo, state, path, bytes, mode).await;
     }
     let (id, uploaded) = repo.put_blob_from(f, size).await?;
-    let entry = Entry { kind: EntryKind::File, mode, size, blob: Some(id), inline: None, target: None };
-    let head = mutate(repo, state, "put", vec![path.to_string()], |mut m: Manifest| {
-        let e = entry.clone();
-        async move {
-            m.entries.insert(path.to_string(), e);
-            Ok(m)
-        }
-    })
+    let entry = Entry {
+        kind: EntryKind::File,
+        mode,
+        size,
+        blob: Some(id),
+        inline: None,
+        target: None,
+    };
+    let head = mutate(
+        repo,
+        state,
+        "put",
+        vec![path.to_string()],
+        |mut m: Manifest| {
+            let e = entry.clone();
+            async move {
+                m.entries.insert(path.to_string(), e);
+                Ok(m)
+            }
+        },
+    )
     .await?;
-    Ok(json!({"state": state, "path": path, "version": head.seq, "size": size, "uploaded": uploaded}))
+    Ok(
+        json!({"state": state, "path": path, "version": head.seq, "size": size, "uploaded": uploaded}),
+    )
 }
 
 pub async fn get(s: &Settings, state: &str, path: &str) -> Result<GetOutput> {
@@ -183,15 +274,25 @@ pub async fn get(s: &Settings, state: &str, path: &str) -> Result<GetOutput> {
 }
 
 pub async fn get_in(repo: &Repo, state: &str, path: &str) -> Result<GetOutput> {
-    let (_, _, m) = current(repo, state).await?.ok_or_else(|| not_found_state(state))?;
-    let e = m.entries.get(path).ok_or_else(|| CarryError::NotFound(format!("{state}:{path}")))?;
+    let (_, _, m) = current(repo, state)
+        .await?
+        .ok_or_else(|| not_found_state(state))?;
+    let e = m
+        .entries
+        .get(path)
+        .ok_or_else(|| CarryError::NotFound(format!("{state}:{path}")))?;
     let bytes = match (&e.kind, &e.inline, &e.blob, &e.target) {
         (EntryKind::Symlink, _, _, Some(t)) => t.as_bytes().to_vec(),
-        (_, Some(b), _, _) => B64.decode(b).map_err(|e| CarryError::Invalid(format!("inline content: {e}")))?,
+        (_, Some(b), _, _) => B64
+            .decode(b)
+            .map_err(|e| CarryError::Invalid(format!("inline content: {e}")))?,
         (_, _, Some(id), _) => repo.get_blob(id).await?.to_vec(),
         _ => return Err(CarryError::Invalid(format!("entry {path} has no content"))),
     };
-    Ok(GetOutput { bytes, mode: e.mode })
+    Ok(GetOutput {
+        bytes,
+        mode: e.mode,
+    })
 }
 
 pub async fn ls(s: &Settings, state: &str, dir: Option<&str>) -> Result<Value> {
@@ -207,16 +308,25 @@ pub async fn ls_in(repo: &Repo, state: &str, dir: Option<&str>) -> Result<Value>
             Some(d.to_string())
         }
     };
-    let (head, _, m) = current(repo, state).await?.ok_or_else(|| not_found_state(state))?;
+    let (head, _, m) = current(repo, state)
+        .await?
+        .ok_or_else(|| not_found_state(state))?;
     let entries: Vec<Value> = m
         .entries
         .iter()
         .filter(|(p, _)| match &prefix {
             None => true,
-            Some(d) => p.as_str() == d || p.strip_prefix(d.as_str()).is_some_and(|r| r.starts_with('/')),
+            Some(d) => {
+                p.as_str() == d
+                    || p.strip_prefix(d.as_str())
+                        .is_some_and(|r| r.starts_with('/'))
+            }
         })
         .map(|(p, e)| {
-            let kind = match e.kind { EntryKind::File => "file", EntryKind::Symlink => "symlink" };
+            let kind = match e.kind {
+                EntryKind::File => "file",
+                EntryKind::Symlink => "symlink",
+            };
             json!({"path": p, "kind": kind, "size": e.size, "mode": e.mode})
         })
         .collect();
@@ -234,10 +344,18 @@ pub async fn rm_in(repo: &Repo, state: &str, path: &str) -> Result<Value> {
     if current(repo, state).await?.is_none() {
         return Err(not_found_state(state));
     }
-    let head = mutate(repo, state, "rm", vec![path.to_string()], |mut m: Manifest| async move {
-        m.entries.remove(path).ok_or_else(|| CarryError::NotFound(format!("{state}:{path}")))?;
-        Ok(m)
-    })
+    let head = mutate(
+        repo,
+        state,
+        "rm",
+        vec![path.to_string()],
+        |mut m: Manifest| async move {
+            m.entries
+                .remove(path)
+                .ok_or_else(|| CarryError::NotFound(format!("{state}:{path}")))?;
+            Ok(m)
+        },
+    )
     .await?;
     Ok(json!({"state": state, "path": path, "version": head.seq}))
 }
@@ -253,7 +371,9 @@ pub async fn mv_in(repo: &Repo, state: &str, from: &str, to: &str) -> Result<Val
     check_path(from)?;
     check_path(to)?;
     if from == to {
-        return Err(CarryError::Usage("mv: source and destination are the same".into()));
+        return Err(CarryError::Usage(
+            "mv: source and destination are the same".into(),
+        ));
     }
     if current(repo, state).await?.is_none() {
         return Err(not_found_state(state));
@@ -261,9 +381,14 @@ pub async fn mv_in(repo: &Repo, state: &str, from: &str, to: &str) -> Result<Val
     let args = vec![from.to_string(), to.to_string()];
     let head = mutate(repo, state, "mv", args, |mut m: Manifest| async move {
         if m.entries.contains_key(to) {
-            return Err(CarryError::Usage(format!("mv: {state}:{to} already exists")));
+            return Err(CarryError::Usage(format!(
+                "mv: {state}:{to} already exists"
+            )));
         }
-        let e = m.entries.remove(from).ok_or_else(|| CarryError::NotFound(format!("{state}:{from}")))?;
+        let e = m
+            .entries
+            .remove(from)
+            .ok_or_else(|| CarryError::NotFound(format!("{state}:{from}")))?;
         m.entries.insert(to.to_string(), e);
         Ok(m)
     })
@@ -280,7 +405,9 @@ pub async fn log(s: &Settings, state: &str, limit: Option<usize>) -> Result<Valu
 
 pub async fn log_in(repo: &Repo, state: &str, limit: Option<usize>) -> Result<Value> {
     let limit = limit.unwrap_or(usize::MAX);
-    let (_, _, mut m) = current(repo, state).await?.ok_or_else(|| not_found_state(state))?;
+    let (_, _, mut m) = current(repo, state)
+        .await?
+        .ok_or_else(|| not_found_state(state))?;
     let mut out = Vec::new();
     while out.len() < limit {
         out.push(json!({
@@ -317,9 +444,22 @@ pub async fn diff(s: &Settings, state: &str, v1: u64, v2: u64) -> Result<Value> 
 pub async fn diff_in(repo: &Repo, state: &str, v1: u64, v2: u64) -> Result<Value> {
     let a = manifest_at(repo, state, v1).await?;
     let b = manifest_at(repo, state, v2).await?;
-    let added: Vec<&String> = b.entries.keys().filter(|k| !a.entries.contains_key(*k)).collect();
-    let removed: Vec<&String> = a.entries.keys().filter(|k| !b.entries.contains_key(*k)).collect();
-    let changed: Vec<&String> = a.entries.iter().filter(|(k, e)| b.entries.get(*k).is_some_and(|f| f != *e)).map(|(k, _)| k).collect();
+    let added: Vec<&String> = b
+        .entries
+        .keys()
+        .filter(|k| !a.entries.contains_key(*k))
+        .collect();
+    let removed: Vec<&String> = a
+        .entries
+        .keys()
+        .filter(|k| !b.entries.contains_key(*k))
+        .collect();
+    let changed: Vec<&String> = a
+        .entries
+        .iter()
+        .filter(|(k, e)| b.entries.get(*k).is_some_and(|f| f != *e))
+        .map(|(k, _)| k)
+        .collect();
     Ok(json!({
         "added": added,
         "removed": removed,
@@ -340,7 +480,12 @@ pub async fn rollback_in(repo: &Repo, state: &str, version: u64) -> Result<Value
     }
     // ADR 0007: rollback holds the state's lease so two rollbacks never interleave.
     // Correctness of every commit still rests on HEAD compare-and-swap.
-    let holder = format!("{}:{}:{:016x}", ctx::make_op("rollback", vec![]).by, std::process::id(), rand::random::<u64>());
+    let holder = format!(
+        "{}:{}:{:016x}",
+        ctx::make_op("rollback", vec![]).by,
+        std::process::id(),
+        rand::random::<u64>()
+    );
     let lease = repo.acquire_lease(state, &holder, None).await?;
     let res = rollback_locked(repo, state, version).await;
     if let Err(e) = repo.release_lease(lease).await {
@@ -351,15 +496,21 @@ pub async fn rollback_in(repo: &Repo, state: &str, version: u64) -> Result<Value
 
 async fn rollback_locked(repo: &Repo, state: &str, version: u64) -> Result<Value> {
     let target = manifest_at(repo, state, version).await?;
-    let head = mutate(repo, state, "rollback", vec![format!("v{version}")], |mut m: Manifest| {
-        let t = target.clone();
-        async move {
-            m.entries = t.entries;
-            m.env = t.env;
-            m.apps = t.apps;
-            Ok(m)
-        }
-    })
+    let head = mutate(
+        repo,
+        state,
+        "rollback",
+        vec![format!("v{version}")],
+        |mut m: Manifest| {
+            let t = target.clone();
+            async move {
+                m.entries = t.entries;
+                m.env = t.env;
+                m.apps = t.apps;
+                Ok(m)
+            }
+        },
+    )
     .await?;
     Ok(json!({"state": state, "version": head.seq, "restored_from": version}))
 }
@@ -371,7 +522,12 @@ pub async fn env_set(s: &Settings, state: &str, kv: Vec<(String, String)>) -> Re
     env_set_in(&open_repo_for_write(s).await?, state, kv, "env_set").await
 }
 
-async fn env_set_in(repo: &Repo, state: &str, kv: Vec<(String, String)>, kind: &str) -> Result<Value> {
+async fn env_set_in(
+    repo: &Repo,
+    state: &str,
+    kv: Vec<(String, String)>,
+    kind: &str,
+) -> Result<Value> {
     check_state(state)?;
     for (k, _) in &kv {
         check_env_key(k)?;
@@ -431,11 +587,16 @@ pub async fn env_get(s: &Settings, state: &str, key: Option<&str>) -> Result<Val
 }
 
 pub async fn env_get_in(repo: &Repo, state: &str, key: Option<&str>) -> Result<Value> {
-    let (_, _, m) = current(repo, state).await?.ok_or_else(|| not_found_state(state))?;
+    let (_, _, m) = current(repo, state)
+        .await?
+        .ok_or_else(|| not_found_state(state))?;
     let env = match key {
         None => m.env,
         Some(k) => {
-            let v = m.env.get(k).ok_or_else(|| CarryError::NotFound(format!("env {k} in '{state}'")))?;
+            let v = m
+                .env
+                .get(k)
+                .ok_or_else(|| CarryError::NotFound(format!("env {k} in '{state}'")))?;
             BTreeMap::from([(k.to_string(), v.clone())])
         }
     };
@@ -452,7 +613,10 @@ pub fn parse_dotenv(text: &str) -> Result<Vec<(String, String)>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+        let line = line
+            .strip_prefix("export ")
+            .map(str::trim_start)
+            .unwrap_or(line);
         let err = || CarryError::Invalid(format!("dotenv line {}: expected KEY=VALUE", i + 1));
         let (k, v) = line.split_once('=').ok_or_else(err)?;
         let k = k.trim();
@@ -479,11 +643,16 @@ pub fn parse_dotenv(text: &str) -> Result<Vec<(String, String)>> {
                 }
             }
             if !closed {
-                return Err(CarryError::Invalid(format!("dotenv line {}: unterminated quote", i + 1)));
+                return Err(CarryError::Invalid(format!(
+                    "dotenv line {}: unterminated quote",
+                    i + 1
+                )));
             }
             s
         } else if let Some(rest) = v.strip_prefix('\'') {
-            let end = rest.find('\'').ok_or_else(|| CarryError::Invalid(format!("dotenv line {}: unterminated quote", i + 1)))?;
+            let end = rest.find('\'').ok_or_else(|| {
+                CarryError::Invalid(format!("dotenv line {}: unterminated quote", i + 1))
+            })?;
             rest[..end].to_string()
         } else {
             match v.find(" #") {
@@ -508,7 +677,9 @@ mod tests {
 
     async fn repo() -> Repo {
         let s = Store::from_object_store(Arc::new(object_store::memory::InMemory::new()), "");
-        Repo::open_or_init(s, Some(MasterKey::generate()), false).await.unwrap()
+        Repo::open_or_init(s, Some(MasterKey::generate()), false)
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -525,12 +696,17 @@ mod tests {
     #[tokio::test]
     async fn put_get_inline_and_blob_with_dedup() {
         let r = repo().await;
-        let v = put_in(&r, "w", "/etc/small", b"hi".to_vec(), 0o600).await.unwrap();
+        let v = put_in(&r, "w", "/etc/small", b"hi".to_vec(), 0o600)
+            .await
+            .unwrap();
         assert_eq!(v["version"], 1);
         assert_eq!(v["uploaded"], false);
         let big = vec![7u8; INLINE_MAX + 10];
         let v = put_in(&r, "w", "/big", big.clone(), 0o644).await.unwrap();
-        assert_eq!((v["version"].as_u64(), v["uploaded"].as_bool()), (Some(2), Some(true)));
+        assert_eq!(
+            (v["version"].as_u64(), v["uploaded"].as_bool()),
+            (Some(2), Some(true))
+        );
         let v = put_in(&r, "w", "/big2", big.clone(), 0o644).await.unwrap();
         assert_eq!(v["uploaded"], false, "dedup");
         let g = get_in(&r, "w", "/etc/small").await.unwrap();
@@ -538,10 +714,19 @@ mod tests {
         assert_eq!(get_in(&r, "w", "/big").await.unwrap().bytes, big);
         let (_, _, m) = current(&r, "w").await.unwrap().unwrap();
         assert!(m.entries["/etc/small"].inline.is_some() && m.entries["/big"].blob.is_some());
-        assert!(matches!(get_in(&r, "w", "/nope").await, Err(CarryError::NotFound(_))));
+        assert!(matches!(
+            get_in(&r, "w", "/nope").await,
+            Err(CarryError::NotFound(_))
+        ));
         let l = ls_in(&r, "w", Some("/etc")).await.unwrap();
         assert_eq!(l["entries"].as_array().unwrap().len(), 1);
-        assert_eq!(ls_in(&r, "w", None).await.unwrap()["entries"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            ls_in(&r, "w", None).await.unwrap()["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
         assert_eq!(states_in(&r).await.unwrap()["states"][0]["version"], 3);
     }
 
@@ -550,57 +735,117 @@ mod tests {
         let r = repo().await;
         put_in(&r, "w", "/a", b"1".to_vec(), 0o644).await.unwrap(); // v1
         put_in(&r, "w", "/b", b"2".to_vec(), 0o644).await.unwrap(); // v2
-        env_set_in(&r, "w", vec![("K".into(), "v".into())], "env_set").await.unwrap(); // v3
+        env_set_in(&r, "w", vec![("K".into(), "v".into())], "env_set")
+            .await
+            .unwrap(); // v3
         mv_in(&r, "w", "/a", "/c").await.unwrap(); // v4
-        assert!(matches!(rm_in(&r, "w", "/zzz").await, Err(CarryError::NotFound(_))));
-        assert!(matches!(rm_in(&r, "nostate", "/a").await, Err(CarryError::NotFound(_))));
+        assert!(matches!(
+            rm_in(&r, "w", "/zzz").await,
+            Err(CarryError::NotFound(_))
+        ));
+        assert!(matches!(
+            rm_in(&r, "nostate", "/a").await,
+            Err(CarryError::NotFound(_))
+        ));
         assert_eq!(rm_in(&r, "w", "/b").await.unwrap()["version"], 5);
-        put_in(&r, "w", "/c", b"changed".to_vec(), 0o644).await.unwrap(); // v6
+        put_in(&r, "w", "/c", b"changed".to_vec(), 0o644)
+            .await
+            .unwrap(); // v6
 
         let log = log_in(&r, "w", None).await.unwrap();
-        let ops: Vec<&str> = log["versions"].as_array().unwrap().iter().map(|v| v["op"].as_str().unwrap()).collect();
+        let ops: Vec<&str> = log["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["op"].as_str().unwrap())
+            .collect();
         assert_eq!(ops, ["put", "rm", "mv", "env_set", "put", "put"]);
         assert_eq!(log["versions"][0]["version"], 6);
-        assert_eq!(log_in(&r, "w", Some(2)).await.unwrap()["versions"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            log_in(&r, "w", Some(2)).await.unwrap()["versions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
 
         let d = diff_in(&r, "w", 2, 6).await.unwrap();
         assert_eq!(d["added"], json!(["/c"]));
         assert_eq!(d["removed"], json!(["/a", "/b"]));
         assert_eq!(d["env_changed"], json!(["K"]));
         let d = diff_in(&r, "w", 4, 6).await.unwrap();
-        assert_eq!((d["changed"].clone(), d["removed"].clone()), (json!(["/c"]), json!(["/b"])));
+        assert_eq!(
+            (d["changed"].clone(), d["removed"].clone()),
+            (json!(["/c"]), json!(["/b"]))
+        );
 
         let rb = rollback_in(&r, "w", 2).await.unwrap();
-        assert_eq!((rb["version"].as_u64(), rb["restored_from"].as_u64()), (Some(7), Some(2)));
+        assert_eq!(
+            (rb["version"].as_u64(), rb["restored_from"].as_u64()),
+            (Some(7), Some(2))
+        );
         let d = diff_in(&r, "w", 2, 7).await.unwrap();
         for k in ["added", "removed", "changed", "env_changed", "apps_changed"] {
             assert_eq!(d[k], json!([]), "{k}");
         }
         let top = &log_in(&r, "w", Some(1)).await.unwrap()["versions"][0];
-        assert_eq!((top["op"].clone(), top["args"].clone()), (json!("rollback"), json!(["v2"])));
-        assert!(matches!(rollback_in(&r, "w", 99).await, Err(CarryError::NotFound(_))));
+        assert_eq!(
+            (top["op"].clone(), top["args"].clone()),
+            (json!("rollback"), json!(["v2"]))
+        );
+        assert!(matches!(
+            rollback_in(&r, "w", 99).await,
+            Err(CarryError::NotFound(_))
+        ));
         // A rollback while another holder has the lease is refused.
         r.acquire_lease("w", "other", None).await.unwrap();
-        assert!(matches!(rollback_in(&r, "w", 2).await, Err(CarryError::Conflict(_))));
+        assert!(matches!(
+            rollback_in(&r, "w", 2).await,
+            Err(CarryError::Conflict(_))
+        ));
     }
 
     #[tokio::test]
     async fn ancestor_and_descendant_entries_are_refused() {
         let r = repo().await;
         put_in(&r, "w", "/a", b"1".to_vec(), 0o644).await.unwrap();
-        let e = put_in(&r, "w", "/a/b", b"2".to_vec(), 0o644).await.unwrap_err();
-        assert!(matches!(e, CarryError::Usage(_)) && e.exit_code() == 2, "{e:?}");
+        let e = put_in(&r, "w", "/a/b", b"2".to_vec(), 0o644)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, CarryError::Usage(_)) && e.exit_code() == 2,
+            "{e:?}"
+        );
         put_in(&r, "w", "/d/e", b"1".to_vec(), 0o644).await.unwrap();
-        assert!(matches!(put_in(&r, "w", "/d", b"2".to_vec(), 0o644).await, Err(CarryError::Usage(_))));
-        assert!(matches!(mv_in(&r, "w", "/a", "/d/e/f").await, Err(CarryError::Usage(_))));
+        assert!(matches!(
+            put_in(&r, "w", "/d", b"2".to_vec(), 0o644).await,
+            Err(CarryError::Usage(_))
+        ));
+        assert!(matches!(
+            mv_in(&r, "w", "/a", "/d/e/f").await,
+            Err(CarryError::Usage(_))
+        ));
         // A symlink entry can never have entries beneath it (no writes through /x -> /etc).
         mutate(&r, "w", "put", vec![], |mut m: Manifest| async move {
-            m.entries.insert("/x".into(), Entry { kind: EntryKind::Symlink, mode: 0o777, size: 4, blob: None, inline: None, target: Some("/etc".into()) });
+            m.entries.insert(
+                "/x".into(),
+                Entry {
+                    kind: EntryKind::Symlink,
+                    mode: 0o777,
+                    size: 4,
+                    blob: None,
+                    inline: None,
+                    target: Some("/etc".into()),
+                },
+            );
             Ok(m)
         })
         .await
         .unwrap();
-        assert!(matches!(put_in(&r, "w", "/x/passwd", b"p".to_vec(), 0o644).await, Err(CarryError::Usage(_))));
+        assert!(matches!(
+            put_in(&r, "w", "/x/passwd", b"p".to_vec(), 0o644).await,
+            Err(CarryError::Usage(_))
+        ));
         // Updating an existing, non-conflicting entry still works.
         put_in(&r, "w", "/a", b"3".to_vec(), 0o644).await.unwrap();
     }
@@ -625,9 +870,15 @@ mod tests {
         let r = repo().await;
         let v = env_import_in(&r, "w", "A=1\nB=2\n").await.unwrap();
         assert_eq!(v["keys"], json!(["A", "B"]));
-        assert_eq!(env_get_in(&r, "w", Some("B")).await.unwrap()["env"], json!({"B": "2"}));
+        assert_eq!(
+            env_get_in(&r, "w", Some("B")).await.unwrap()["env"],
+            json!({"B": "2"})
+        );
         env_unset_in(&r, "w", vec!["A".into()]).await.unwrap();
-        assert_eq!(env_get_in(&r, "w", None).await.unwrap()["env"], json!({"B": "2"}));
+        assert_eq!(
+            env_get_in(&r, "w", None).await.unwrap()["env"],
+            json!({"B": "2"})
+        );
         let top = &log_in(&r, "w", Some(1)).await.unwrap()["versions"][0];
         assert_eq!(top["args"], json!(["A"]));
     }
@@ -635,11 +886,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_puts_cas_retry() {
         let r = Arc::new(repo().await);
-        put_in(&r, "w", "/seed", b"0".to_vec(), 0o644).await.unwrap();
+        put_in(&r, "w", "/seed", b"0".to_vec(), 0o644)
+            .await
+            .unwrap();
         let mut hs = Vec::new();
         for i in 0..2 {
             let r = r.clone();
-            hs.push(tokio::spawn(async move { put_in(&r, "w", &format!("/f{i}"), vec![i as u8], 0o644).await }));
+            hs.push(tokio::spawn(async move {
+                put_in(&r, "w", &format!("/f{i}"), vec![i as u8], 0o644).await
+            }));
         }
         let mut vs: Vec<u64> = Vec::new();
         for h in hs {
