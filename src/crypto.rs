@@ -222,6 +222,167 @@ pub fn blob_id(k: &DataKey, pt: &[u8]) -> String {
     blake3::keyed_hash(&k.id_key, pt).to_hex().to_string()
 }
 
+// ---- blob envelope: single-shot or chunked STREAM (bounded memory) ----
+
+/// First byte of every blob object written by this carry.
+pub const FMT_SINGLE: u8 = 1;
+pub const FMT_CHUNKED: u8 = 2;
+/// Plaintext bytes per chunk in the chunked format.
+pub const CHUNK_SIZE: usize = 1 << 20;
+/// Blobs larger than this use the chunked format.
+pub const CHUNK_THRESHOLD: u64 = 4 << 20;
+/// XChaCha nonce (24) minus the STREAM counter (4) and last-flag (1).
+pub const STREAM_PREFIX_LEN: usize = 19;
+/// Frame header: u32 BE, top bit = final chunk, low 31 bits = payload length.
+pub const FRAME_LAST: u32 = 1 << 31;
+/// Largest payload a frame may declare (zstd can expand incompressible data slightly).
+pub const FRAME_MAX: usize = CHUNK_SIZE + CHUNK_SIZE / 8 + 4096;
+const STREAM_AAD: &[u8] = b"carry chunked blob v1";
+
+type StreamEnc = chacha20poly1305::aead::stream::EncryptorBE32<XChaCha20Poly1305>;
+type StreamDec = chacha20poly1305::aead::stream::DecryptorBE32<XChaCha20Poly1305>;
+
+/// Seals plaintext chunks into frames. The STREAM construction authenticates the chunk
+/// index and the final-chunk flag, so truncation, reordering and splicing fail to open.
+pub struct ChunkEncoder {
+    enc: Option<StreamEnc>,
+    encrypted: bool,
+    done: bool,
+}
+
+impl ChunkEncoder {
+    /// One frame (header + payload). `last` must be true for exactly the final chunk.
+    pub fn frame(&mut self, chunk: &[u8], last: bool) -> Result<Vec<u8>> {
+        if self.done {
+            return Err(CarryError::Internal(anyhow::anyhow!("chunk after final chunk")));
+        }
+        let z = compress(chunk)?;
+        let payload = if self.encrypted {
+            let p = chacha20poly1305::aead::Payload { msg: &z, aad: STREAM_AAD };
+            let r = if last {
+                self.done = true;
+                self.enc.take().expect("encoder present").encrypt_last(p)
+            } else {
+                self.enc.as_mut().expect("encoder present").encrypt_next(p)
+            };
+            r.map_err(|_| CarryError::Internal(anyhow::anyhow!("stream encrypt failed")))?
+        } else {
+            self.done = last;
+            z
+        };
+        let mut hdr = payload.len() as u32;
+        if last {
+            hdr |= FRAME_LAST;
+        }
+        let mut out = Vec::with_capacity(4 + payload.len());
+        out.extend_from_slice(&hdr.to_be_bytes());
+        out.extend_from_slice(&payload);
+        Ok(out)
+    }
+}
+
+/// Opens frames produced by `ChunkEncoder`, in order.
+pub struct ChunkDecoder {
+    dec: Option<StreamDec>,
+    encrypted: bool,
+    pub done: bool,
+}
+
+impl ChunkDecoder {
+    pub fn open_frame(&mut self, payload: &[u8], last: bool) -> Result<Vec<u8>> {
+        if self.done {
+            return Err(CarryError::Invalid("data after final chunk".into()));
+        }
+        let z = if self.encrypted {
+            let p = chacha20poly1305::aead::Payload { msg: payload, aad: STREAM_AAD };
+            let r = if last {
+                self.done = true;
+                self.dec.take().expect("decoder present").decrypt_last(p)
+            } else {
+                self.dec.as_mut().expect("decoder present").decrypt_next(p)
+            };
+            r.map_err(|_| CarryError::Invalid("chunk authentication failed".into()))?
+        } else {
+            self.done = last;
+            payload.to_vec()
+        };
+        decompress(&z)
+    }
+}
+
+/// Parse a frame header.
+pub fn frame_header(h: [u8; 4]) -> Result<(usize, bool)> {
+    let v = u32::from_be_bytes(h);
+    let len = (v & !FRAME_LAST) as usize;
+    if len > FRAME_MAX {
+        return Err(CarryError::Invalid(format!("chunk frame too large ({len} bytes)")));
+    }
+    Ok((len, v & FRAME_LAST != 0))
+}
+
+impl Cipher {
+    /// Streaming hasher producing the same id as `blob_id`.
+    pub fn id_hasher(&self) -> blake3::Hasher {
+        match self {
+            Cipher::Encrypted(k) => blake3::Hasher::new_keyed(&k.id_key),
+            Cipher::None => blake3::Hasher::new(),
+        }
+    }
+    /// Length of the chunked-format header after the format byte.
+    pub fn stream_prefix_len(&self) -> usize {
+        if self.is_encrypted() { STREAM_PREFIX_LEN } else { 0 }
+    }
+    /// (header bytes incl. format byte, encoder).
+    pub fn chunk_encoder(&self) -> (Vec<u8>, ChunkEncoder) {
+        let mut hdr = vec![FMT_CHUNKED];
+        match self {
+            Cipher::Encrypted(k) => {
+                let mut prefix = [0u8; STREAM_PREFIX_LEN];
+                rand::thread_rng().fill_bytes(&mut prefix);
+                hdr.extend_from_slice(&prefix);
+                let enc = StreamEnc::from_aead(k.cipher(), (&prefix).into());
+                (hdr, ChunkEncoder { enc: Some(enc), encrypted: true, done: false })
+            }
+            Cipher::None => (hdr, ChunkEncoder { enc: None, encrypted: false, done: false }),
+        }
+    }
+    /// Decoder for a chunked blob; `prefix` is the header after the format byte.
+    pub fn chunk_decoder(&self, prefix: &[u8]) -> Result<ChunkDecoder> {
+        match self {
+            Cipher::Encrypted(k) => {
+                let arr: [u8; STREAM_PREFIX_LEN] =
+                    prefix.try_into().map_err(|_| CarryError::Invalid("bad chunked blob header".into()))?;
+                let dec = StreamDec::from_aead(k.cipher(), (&arr).into());
+                Ok(ChunkDecoder { dec: Some(dec), encrypted: true, done: false })
+            }
+            Cipher::None => Ok(ChunkDecoder { dec: None, encrypted: false, done: false }),
+        }
+    }
+    /// Whole blob object for an in-memory plaintext (single-shot or chunked by size).
+    pub fn encode_blob(&self, pt: &[u8]) -> Result<Vec<u8>> {
+        if pt.len() as u64 <= CHUNK_THRESHOLD {
+            let mut out = vec![FMT_SINGLE];
+            out.extend_from_slice(&self.compress_seal(pt)?);
+            return Ok(out);
+        }
+        let (mut out, mut enc) = self.chunk_encoder();
+        let n = pt.len().div_ceil(CHUNK_SIZE);
+        for (i, c) in pt.chunks(CHUNK_SIZE).enumerate() {
+            out.extend_from_slice(&enc.frame(c, i + 1 == n)?);
+        }
+        Ok(out)
+    }
+    /// Decode a single-shot object (with FMT_SINGLE header, or a legacy headerless one).
+    pub fn decode_single(&self, data: &[u8]) -> Result<Vec<u8>> {
+        if data.first() == Some(&FMT_SINGLE) {
+            if let Ok(v) = self.open_decompress(&data[1..]) {
+                return Ok(v);
+            }
+        }
+        self.open_decompress(data)
+    }
+}
+
 // ---- Ed25519 ----
 
 /// Returns (secret key base64 [32-byte seed], public key base64).

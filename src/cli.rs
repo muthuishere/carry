@@ -142,7 +142,11 @@ pub enum ToolCmd {
         required: bool,
     },
     Rm { state: String, name: String },
-    Keygen,
+    Keygen {
+        /// Where to write the private key (default ~/.config/carry/tool-signing.key)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -183,7 +187,7 @@ impl Command {
             | Command::Mv { .. }
             | Command::Rollback { .. } => true,
             Command::Env(e) => !matches!(e, EnvCmd::Get { .. }),
-            Command::Tool(t) => !matches!(t, ToolCmd::Ls { .. } | ToolCmd::Keygen),
+            Command::Tool(t) => !matches!(t, ToolCmd::Ls { .. } | ToolCmd::Keygen { .. }),
             _ => false,
         }
     }
@@ -382,12 +386,26 @@ async fn dispatch(cli: Cli) -> Result<Outcome> {
         Command::Doctor => adapter::doctor(&s).await?,
         Command::Put { target, source, mode: mode_flag } => {
             let (state, path) = parse_state_path(&target)?;
-            let (bytes, mut mode) = read_source(&source)?;
-            if let Some(m) = mode_flag {
-                mode = u32::from_str_radix(m.trim_start_matches("0o"), 8)
-                    .map_err(|_| CarryError::Usage(format!("invalid --mode '{m}' (expected octal like 0644)")))?;
+            let mode_flag = match mode_flag {
+                Some(m) => Some(
+                    u32::from_str_radix(m.trim_start_matches("0o"), 8)
+                        .map_err(|_| CarryError::Usage(format!("invalid --mode '{m}' (expected octal like 0644)")))?,
+                ),
+                None => None,
+            };
+            if source == "-" {
+                let (bytes, mode) = read_source(&source)?;
+                adapter::put(&s, &state, &path, bytes, mode_flag.unwrap_or(mode)).await?
+            } else {
+                // Files stream from disk with bounded memory.
+                let md = std::fs::metadata(&source).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => CarryError::NotFound(source.clone()),
+                    _ => CarryError::Usage(format!("cannot read {source}: {e}")),
+                })?;
+                use std::os::unix::fs::PermissionsExt;
+                let mode = mode_flag.unwrap_or(md.permissions().mode() & 0o7777);
+                crate::ops::put_file(&s, &state, &path, std::path::Path::new(&source), mode).await?
             }
-            adapter::put(&s, &state, &path, bytes, mode).await?
         }
         Command::Get { target, dest } => {
             let (state, path) = parse_state_path(&target)?;
@@ -479,7 +497,7 @@ async fn dispatch(cli: Cli) -> Result<Outcome> {
                 adapter::tool_add(&s, &state, &name, r).await?
             }
             ToolCmd::Rm { state, name } => adapter::tool_rm(&s, &state, &name).await?,
-            ToolCmd::Keygen => adapter::tool_keygen(&s).await?,
+            ToolCmd::Keygen { out } => adapter::tool_keygen(&s, out.as_deref()).await?,
         },
         Command::Profile(_) => unreachable!("handled above"),
     };
@@ -604,7 +622,7 @@ mod adapter {
     pub async fn tool_ls(s: &Settings, name: Option<&str>) -> Result<Value> { crate::tools::ls(s, name).await }
     pub async fn tool_add(s: &Settings, state: &str, name: &str, r: ToolRef) -> Result<Value> { crate::tools::add(s, state, name, r).await }
     pub async fn tool_rm(s: &Settings, state: &str, name: &str) -> Result<Value> { crate::tools::rm(s, state, name).await }
-    pub async fn tool_keygen(s: &Settings) -> Result<Value> { crate::tools::keygen(s).await }
+    pub async fn tool_keygen(s: &Settings, out: Option<&std::path::Path>) -> Result<Value> { crate::tools::keygen(s, out).await }
 }
 
 #[cfg(test)]

@@ -143,17 +143,10 @@ async fn write_generation(repo: &Repo, m: &Manifest, root: &Path) -> Result<()> 
         }
     }
     let mut stream = futures::stream::iter(jobs)
-        .map(|(path, e, dest)| async move {
-            let bytes = entry_bytes(repo, &path, &e).await?;
-            Ok::<_, CarryError>((path, e, dest, bytes))
-        })
+        .map(|(path, e, dest)| async move { write_entry(repo, &path, &e, &dest).await })
         .buffer_unordered(BLOB_CONCURRENCY);
     while let Some(r) = stream.next().await {
-        let (path, e, dest, bytes) = r?;
-        if bytes.len() as u64 != e.size {
-            return Err(CarryError::Invalid(format!("{path}: size {} != manifest {}", bytes.len(), e.size)));
-        }
-        write_file(&dest, &bytes, e.mode).map_err(io)?;
+        r?;
     }
     drop(stream);
 
@@ -170,22 +163,45 @@ async fn write_generation(repo: &Repo, m: &Manifest, root: &Path) -> Result<()> 
     switch_current(root, m.seq).map_err(io)
 }
 
-async fn entry_bytes(repo: &Repo, path: &str, e: &Entry) -> Result<Vec<u8>> {
-    if let Some(b64) = &e.inline {
-        return base64::engine::general_purpose::STANDARD
+/// Write one file entry to `dest`, streaming blobs with bounded memory.
+async fn write_entry(repo: &Repo, path: &str, e: &Entry, dest: &Path) -> Result<()> {
+    let n = if let Some(b64) = &e.inline {
+        let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64)
-            .map_err(|err| CarryError::Invalid(format!("{path}: bad inline content: {err}")));
+            .map_err(|err| CarryError::Invalid(format!("{path}: bad inline content: {err}")))?;
+        write_file(dest, &bytes, e.mode).map_err(io)?;
+        bytes.len() as u64
+    } else {
+        match &e.blob {
+            Some(id) => {
+                let f = open_dest(dest, e.mode).map_err(io)?;
+                let mut w = std::io::BufWriter::with_capacity(256 << 10, f);
+                let n = repo.get_blob_to(id, &mut w).await?;
+                let f = w.into_inner().map_err(|e| io(e.into_error()))?;
+                f.sync_all().map_err(io)?;
+                n
+            }
+            None if e.size == 0 => {
+                write_file(dest, &[], e.mode).map_err(io)?;
+                0
+            }
+            None => return Err(CarryError::Invalid(format!("{path}: entry has no content"))),
+        }
+    };
+    if n != e.size {
+        return Err(CarryError::Invalid(format!("{path}: size {n} != manifest {}", e.size)));
     }
-    match &e.blob {
-        Some(id) => Ok(repo.get_blob(id).await?.to_vec()),
-        None if e.size == 0 => Ok(Vec::new()),
-        None => Err(CarryError::Invalid(format!("{path}: entry has no content"))),
-    }
+    Ok(())
+}
+
+fn open_dest(dest: &Path, mode: u32) -> std::io::Result<std::fs::File> {
+    let f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(dest)?;
+    f.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))?;
+    Ok(f)
 }
 
 fn write_file(dest: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(dest)?;
-    f.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))?;
+    let mut f = open_dest(dest, mode)?;
     f.write_all(bytes)?;
     f.sync_all()
 }
@@ -277,7 +293,26 @@ fn cleanup(root: &Path) {
 
 /// Make every manifest path P a symlink to `<root>/current/files/P`.
 /// Skips (with a warning) whatever it cannot do; returns the number linked.
+/// Paths materialised last time that are gone from `m` are unlinked, but only when the
+/// link still points into `<root>/current/files/` or `<root>/gens/`.
 pub fn materialise(root: &Path, m: &Manifest) -> usize {
+    let record = root.join("materialised.json");
+    let prev: Vec<String> = std::fs::read(&record)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    for path in prev.iter().filter(|p| !m.entries.contains_key(*p)) {
+        if let Err(e) = unlink_ours(root, path) {
+            eprintln!("carry: warning: cannot remove {path}: {e}");
+        }
+    }
+    let keys: Vec<&String> = m.entries.keys().collect();
+    if let Ok(b) = serde_json::to_vec(&keys) {
+        let tmp = root.join(".materialised.json.tmp");
+        if std::fs::write(&tmp, b).is_ok() {
+            let _ = std::fs::rename(&tmp, &record);
+        }
+    }
     let mut n = 0;
     for path in m.entries.keys() {
         match materialise_one(root, path) {
@@ -286,6 +321,21 @@ pub fn materialise(root: &Path, m: &Manifest) -> usize {
         }
     }
     n
+}
+
+/// Remove the symlink at `path` iff it is one of ours (points into our tree).
+fn unlink_ours(root: &Path, path: &str) -> std::io::Result<()> {
+    let p = Path::new(path);
+    match std::fs::symlink_metadata(p) {
+        Ok(md) if md.file_type().is_symlink() => {
+            let t = std::fs::read_link(p)?;
+            if t.starts_with(root.join("current").join("files")) || t.starts_with(root.join("gens")) {
+                std::fs::remove_file(p)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn materialise_one(root: &Path, path: &str) -> std::io::Result<()> {
@@ -477,6 +527,87 @@ pub(crate) mod tests {
         restore_with(async { Ok(repo.clone()) }, "w", &root, budget()).await;
         assert_eq!(std::fs::read(&a).unwrap(), b"v2");
         assert_eq!(std::fs::read(&untouched).unwrap(), b"x");
+    }
+
+    #[tokio::test]
+    async fn materialise_removes_only_our_dropped_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let fs = tmp.path().join("fs");
+        std::fs::create_dir_all(&fs).unwrap();
+        let (a, b, c) = (fs.join("a"), fs.join("b"), fs.join("c"));
+        let (sa, sb, sc) = (a.display().to_string(), b.display().to_string(), c.display().to_string());
+        let repo = mem_repo().await;
+        commit_files(&repo, "w", &[(&sa, b"1"), (&sb, b"2"), (&sc, b"3")], &[]).await;
+        restore_with(async { Ok(repo.clone()) }, "w", &root, budget()).await;
+        assert_eq!(materialise(&root, &current_manifest(&root).unwrap()), 3);
+        // Someone repoints c elsewhere: not ours any more.
+        let elsewhere = fs.join("elsewhere");
+        std::fs::write(&elsewhere, b"mine").unwrap();
+        std::fs::remove_file(&c).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &c).unwrap();
+        crate::ops::rm_in(&repo, "w", &sb).await.unwrap();
+        crate::ops::rm_in(&repo, "w", &sc).await.unwrap();
+        restore_with(async { Ok(repo.clone()) }, "w", &root, budget()).await;
+        assert_eq!(materialise(&root, &current_manifest(&root).unwrap()), 1);
+        assert_eq!(std::fs::read(&a).unwrap(), b"1");
+        assert!(std::fs::symlink_metadata(&b).is_err(), "dropped link removed");
+        assert_eq!(std::fs::read(&c).unwrap(), b"mine", "foreign link untouched");
+    }
+
+    /// Peak RSS of this process in bytes.
+    fn peak_rss() -> u64 {
+        if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
+            if let Some(l) = st.lines().find(|l| l.starts_with("VmHWM:")) {
+                let kb: u64 = l.split_whitespace().nth(1).unwrap().parse().unwrap();
+                return kb * 1024;
+            }
+        }
+        let ru = nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_SELF).unwrap();
+        let v = ru.max_rss() as u64;
+        if cfg!(target_os = "macos") { v } else { v * 1024 }
+    }
+
+    /// Bounded memory (spec: container-runtime "Bounded memory"). Run alone, in release:
+    /// `cargo test --release -- --ignored --test-threads=1 bounded_memory`
+    #[tokio::test]
+    #[ignore]
+    async fn bounded_memory_put_and_restore_200mib() {
+        const SIZE: usize = 200 << 20;
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let store = Store::from_object_store(
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&bucket).unwrap()),
+            "r",
+        );
+        let mk = crate::crypto::MasterKey::from_bytes([9; 32]);
+        let repo = Repo::open_or_init(store, Some(mk), false).await.unwrap();
+        // Incompressible source file, written in 1 MiB pieces.
+        let src = tmp.path().join("big.bin");
+        {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&src).unwrap());
+            let mut buf = vec![0u8; 1 << 20];
+            for _ in 0..(SIZE >> 20) {
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut buf);
+                f.write_all(&buf).unwrap();
+            }
+        }
+        let base = peak_rss();
+        crate::ops::put_file_in(&repo, "w", "/data/big.bin", &src, 0o644).await.unwrap();
+        let after_put = peak_rss();
+        let root = tmp.path().join("root");
+        let r = restore_with(async { Ok(repo.clone()) }, "w", &root, Duration::from_secs(600)).await;
+        assert_eq!(r.mode, Mode::Ok, "{:?}", r.error);
+        let after_restore = peak_rss();
+        let out = root.join("current/files/data/big.bin");
+        assert_eq!(std::fs::metadata(&out).unwrap().len(), SIZE as u64);
+        let mib = |b: u64| b as f64 / (1 << 20) as f64;
+        println!(
+            "RSS peak: base {:.1} MiB, after put {:.1} MiB (+{:.1}), after restore {:.1} MiB (+{:.1} total)",
+            mib(base), mib(after_put), mib(after_put - base), mib(after_restore), mib(after_restore - base)
+        );
+        assert!(after_restore - base < 64 << 20, "peak RSS grew {:.1} MiB", mib(after_restore - base));
     }
 
     #[tokio::test]

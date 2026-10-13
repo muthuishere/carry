@@ -41,3 +41,21 @@ fn env_repo_beats_profile_repo() {
     let o = run(&p, &["--json", "states"], &[("CARRY_REPO", "s3://env/x")]);
     assert_ne!(o.status.code(), Some(2), "{}", String::from_utf8_lossy(&o.stdout));
 }
+
+#[test]
+fn keygen_out_with_missing_signing_key_file() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = d.path().join("c.yaml");
+    let key = d.path().join("keys/signing.key");
+    let k = key.to_str().unwrap();
+    // CARRY_TOOL_SIGNING_KEY_FILE names the file keygen is about to create.
+    let envs = [("CARRY_TOOL_SIGNING_KEY_FILE", k)];
+    let o = run(&cfg, &["--json", "tool", "keygen", "--out", k], &envs);
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stdout));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("public_key"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+    // Refuses to overwrite.
+    let o = run(&cfg, &["--json", "tool", "keygen", "--out", k], &envs);
+    assert_ne!(o.status.code(), Some(0));
+}

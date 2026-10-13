@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use crate::crypto::{Cipher, DataKey, MasterKey, WrappedKey};
+use crate::crypto::{frame_header, CHUNK_SIZE, CHUNK_THRESHOLD, FMT_CHUNKED};
 use crate::error::{CarryError, Result};
 use crate::model::{Head, Manifest, FORMAT_VERSION};
 use crate::store::Store;
@@ -12,6 +13,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const CONFIG_KEY: &str = "config";
 pub const LEASE_TTL_SECS: i64 = 15;
+/// Multipart part size for chunked uploads (S3 minimum is 5 MiB).
+const PART_SIZE: usize = 8 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoConfig {
@@ -169,7 +172,7 @@ impl Repo {
         if self.store.exists(&key).await? {
             return Ok((id, false));
         }
-        let body = self.cipher.compress_seal(plaintext)?;
+        let body = self.cipher.encode_blob(plaintext)?;
         let uploaded = self.store.put_if_absent(&key, Bytes::from(body)).await?;
         Ok((id, uploaded))
     }
@@ -178,7 +181,7 @@ impl Repo {
         let id = self.cipher.blob_id(plaintext);
         let key = keyf(&id);
         if !self.store.exists(&key).await? {
-            let body = self.cipher.compress_seal(plaintext)?;
+            let body = self.cipher.encode_blob(plaintext)?;
             self.store.put_if_absent(&key, Bytes::from(body)).await?;
         }
         Ok(id)
@@ -195,13 +198,188 @@ impl Repo {
     }
 
     async fn get_blob_at(&self, id: &str, keyf: fn(&str) -> String) -> Result<Bytes> {
+        let mut out = Vec::new();
+        self.get_to_at(id, keyf, &mut out).await?;
+        Ok(Bytes::from(out))
+    }
+
+    /// Stream a blob's plaintext into `w` with bounded buffers (about one chunk).
+    /// The id is verified at the end; on error `w` may hold partial data.
+    pub async fn get_blob_to<W: std::io::Write + Send>(&self, id: &str, w: &mut W) -> Result<u64> {
+        self.get_to_at(id, blob_key, w).await
+    }
+
+    pub async fn get_tool_blob_to<W: std::io::Write + Send>(&self, id: &str, w: &mut W) -> Result<u64> {
+        self.get_to_at(id, tool_blob_key, w).await
+    }
+
+    /// Upload from a seekable reader of exactly `size` bytes with bounded buffers.
+    /// Pass 1 hashes (the id), pass 2 uploads (multipart for chunked blobs).
+    /// Returns (id, uploaded).
+    pub async fn put_blob_from<R: std::io::Read + std::io::Seek + Send>(&self, r: R, size: u64) -> Result<(String, bool)> {
+        self.put_from_at(r, size, blob_key).await
+    }
+
+    pub async fn put_tool_blob_from<R: std::io::Read + std::io::Seek + Send>(&self, r: R, size: u64) -> Result<(String, bool)> {
+        self.put_from_at(r, size, tool_blob_key).await
+    }
+
+    async fn put_from_at<R: std::io::Read + std::io::Seek + Send>(
+        &self,
+        mut r: R,
+        size: u64,
+        keyf: fn(&str) -> String,
+    ) -> Result<(String, bool)> {
+        use std::io::SeekFrom;
+        let ioe = |e: std::io::Error| CarryError::Internal(anyhow::anyhow!("read: {e}"));
+        r.seek(SeekFrom::Start(0)).map_err(ioe)?;
+        let mut h = self.cipher.id_hasher();
+        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut seen = 0u64;
+        loop {
+            let n = r.read(&mut buf).map_err(ioe)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+            seen += n as u64;
+        }
+        if seen != size {
+            return Err(CarryError::Invalid(format!("source changed while reading ({seen} != {size} bytes)")));
+        }
+        let id = h.finalize().to_hex().to_string();
+        let key = keyf(&id);
+        if self.store.exists(&key).await? {
+            return Ok((id, false));
+        }
+        r.seek(SeekFrom::Start(0)).map_err(ioe)?;
+        if size <= CHUNK_THRESHOLD {
+            let mut pt = Vec::with_capacity(size as usize);
+            std::io::Read::read_to_end(&mut r.take(size), &mut pt).map_err(ioe)?;
+            if self.cipher.blob_id(&pt) != id {
+                return Err(CarryError::Invalid("source changed while reading".into()));
+            }
+            let up = self.store.put_if_absent(&key, Bytes::from(self.cipher.encode_blob(&pt)?)).await?;
+            return Ok((id, up));
+        }
+        let mut up = self.store.put_multipart(&key).await?;
+        let res: Result<()> = async {
+            let (hdr, mut enc) = self.cipher.chunk_encoder();
+            let mut part = hdr;
+            let mut h2 = self.cipher.id_hasher();
+            let mut left = size;
+            while left > 0 {
+                let n = (left as usize).min(CHUNK_SIZE);
+                r.read_exact(&mut buf[..n]).map_err(ioe)?;
+                h2.update(&buf[..n]);
+                left -= n as u64;
+                part.extend_from_slice(&enc.frame(&buf[..n], left == 0)?);
+                if part.len() >= PART_SIZE {
+                    let p = std::mem::take(&mut part);
+                    up.put_part(object_store::PutPayload::from(p)).await.map_err(crate::store::map_err)?;
+                }
+            }
+            if h2.finalize().to_hex().as_str() != id {
+                return Err(CarryError::Invalid("source changed while reading".into()));
+            }
+            if !part.is_empty() {
+                up.put_part(object_store::PutPayload::from(part)).await.map_err(crate::store::map_err)?;
+            }
+            up.complete().await.map_err(crate::store::map_err)?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = res {
+            let _ = up.abort().await;
+            return Err(e);
+        }
+        Ok((id, true))
+    }
+
+    async fn get_to_at<W: std::io::Write + Send>(&self, id: &str, keyf: fn(&str) -> String, w: &mut W) -> Result<u64> {
+        use futures::StreamExt;
         check_id(id)?;
-        let raw = self.store.get(&keyf(id)).await?;
-        let pt = self.cipher.open_decompress(&raw)?;
-        if self.cipher.blob_id(&pt) != id {
+        let wr = |e: std::io::Error| CarryError::Internal(anyhow::anyhow!("write: {e}"));
+        let mut s = self.store.get_stream(&keyf(id)).await?;
+        let mut buf: Vec<u8> = Vec::new();
+        // Read until we know the format.
+        while buf.is_empty() {
+            match s.next().await {
+                Some(c) => buf.extend_from_slice(&c?),
+                None => break,
+            }
+        }
+        let mut h = self.cipher.id_hasher();
+        let mut total = 0u64;
+        if buf.first() == Some(&FMT_CHUNKED) {
+            let plen = 1 + self.cipher.stream_prefix_len();
+            let mut eof = false;
+            // Fill until the header is present.
+            while buf.len() < plen && !eof {
+                match s.next().await {
+                    Some(c) => buf.extend_from_slice(&c?),
+                    None => eof = true,
+                }
+            }
+            if buf.len() < plen {
+                return Err(CarryError::Invalid(format!("blob {id}: truncated header")));
+            }
+            let mut dec = self.cipher.chunk_decoder(&buf[1..plen])?;
+            let mut pos = plen;
+            loop {
+                // Need a frame header + payload in buf[pos..].
+                let avail = buf.len() - pos;
+                let need = if avail >= 4 {
+                    let (len, _) = frame_header(buf[pos..pos + 4].try_into().unwrap())?;
+                    4 + len
+                } else {
+                    4
+                };
+                if avail >= need && avail >= 4 {
+                    let (len, last) = frame_header(buf[pos..pos + 4].try_into().unwrap())?;
+                    let pt = dec.open_frame(&buf[pos + 4..pos + 4 + len], last)?;
+                    h.update(&pt);
+                    w.write_all(&pt).map_err(wr)?;
+                    total += pt.len() as u64;
+                    pos += 4 + len;
+                    if dec.done {
+                        // Drain: anything left is an error.
+                        if pos != buf.len() {
+                            return Err(CarryError::Invalid(format!("blob {id}: data after final chunk")));
+                        }
+                        while let Some(c) = s.next().await {
+                            if !c?.is_empty() {
+                                return Err(CarryError::Invalid(format!("blob {id}: data after final chunk")));
+                            }
+                        }
+                        break;
+                    }
+                    continue;
+                }
+                // Compact, then read more.
+                if pos > 0 {
+                    buf.drain(..pos);
+                    pos = 0;
+                }
+                match s.next().await {
+                    Some(c) => buf.extend_from_slice(&c?),
+                    None => return Err(CarryError::Invalid(format!("blob {id}: truncated (no final chunk)"))),
+                }
+            }
+        } else {
+            while let Some(c) = s.next().await {
+                buf.extend_from_slice(&c?);
+            }
+            let pt = self.cipher.decode_single(&buf)?;
+            h.update(&pt);
+            w.write_all(&pt).map_err(wr)?;
+            total = pt.len() as u64;
+        }
+        if h.finalize().to_hex().as_str() != id {
             return Err(CarryError::Invalid(format!("blob {id} content does not match its id")));
         }
-        Ok(Bytes::from(pt))
+        w.flush().map_err(wr)?;
+        Ok(total)
     }
 
     // ---- manifests & HEAD ----
@@ -455,6 +633,93 @@ pub(crate) mod tests {
         assert!(rep.if_none_match && rep.if_match);
     }
 
+    fn noise(n: usize) -> Vec<u8> {
+        let mut v = vec![0u8; n];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut v);
+        v
+    }
+
+    /// (offset, len) of each frame in a chunked object.
+    fn frames(raw: &[u8], prefix: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut pos = 1 + prefix;
+        while pos < raw.len() {
+            let (len, _) = crate::crypto::frame_header(raw[pos..pos + 4].try_into().unwrap()).unwrap();
+            out.push((pos, 4 + len));
+            pos += 4 + len;
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn chunked_blobs_stream_and_resist_truncation_and_reordering() {
+        let s = mem();
+        let r = Repo::open_or_init(s.clone(), Some(crate::crypto::MasterKey::from_bytes([7; 32])), false).await.unwrap();
+        let data = noise(CHUNK_SIZE * 5 + 123);
+        // Streaming put (multipart) and slice put agree on the id; dedup holds.
+        let (id, up) = r.put_blob_from(std::io::Cursor::new(&data), data.len() as u64).await.unwrap();
+        assert!(up);
+        assert_eq!(r.put_blob_report(&data).await.unwrap(), (id.clone(), false));
+        assert_eq!(id, r.blob_id(&data));
+        let raw = s.get(&blob_key(&id)).await.unwrap().to_vec();
+        assert_eq!(raw[0], FMT_CHUNKED);
+        let mut out = Vec::new();
+        assert_eq!(r.get_blob_to(&id, &mut out).await.unwrap(), data.len() as u64);
+        assert!(out == data);
+        // Size mismatch is refused.
+        assert!(r.put_blob_from(std::io::Cursor::new(&data), 5).await.is_err());
+
+        let fr = frames(&raw, crate::crypto::STREAM_PREFIX_LEN);
+        assert_eq!(fr.len(), 6);
+        let check = |body: Vec<u8>| {
+            let (s, r, id) = (s.clone(), r.clone(), id.clone());
+            async move {
+                s.put(&blob_key(&id), Bytes::from(body)).await.unwrap();
+                r.get_blob_to(&id, &mut Vec::new()).await
+            }
+        };
+        // Truncated: drop the final frame.
+        let (lo, _) = fr[5];
+        assert!(matches!(check(raw[..lo].to_vec()).await, Err(CarryError::Invalid(_))));
+        // Truncated at a non-final frame boundary, with the flag forged to "last".
+        let (p4, l4) = fr[4];
+        let mut forged = raw[..p4 + l4].to_vec();
+        forged[p4] |= 0x80;
+        assert!(matches!(check(forged).await, Err(CarryError::Invalid(_))));
+        // Reordered: swap frames 1 and 2 (same length).
+        let (a, la) = fr[1];
+        let (b, lb) = fr[2];
+        assert_eq!(la, lb);
+        let mut sw = raw.clone();
+        sw[a..a + la].copy_from_slice(&raw[b..b + lb]);
+        sw[b..b + lb].copy_from_slice(&raw[a..a + la]);
+        assert!(matches!(check(sw).await, Err(CarryError::Invalid(_))));
+        // Trailing garbage after the final frame.
+        let mut tail = raw.clone();
+        tail.extend_from_slice(b"xx");
+        assert!(matches!(check(tail).await, Err(CarryError::Invalid(_))));
+        // Intact again.
+        assert!(check(raw.clone()).await.is_ok());
+
+        // Legacy headerless single-shot objects stay readable; new small ones carry FMT_SINGLE.
+        let small = b"legacy blob".to_vec();
+        let sid = r.blob_id(&small);
+        s.put(&blob_key(&sid), Bytes::from(r.cipher.compress_seal(&small).unwrap())).await.unwrap();
+        assert_eq!(&r.get_blob(&sid).await.unwrap()[..], &small[..]);
+        let nid = r.put_blob(b"fresh").await.unwrap();
+        assert_eq!(s.get(&blob_key(&nid)).await.unwrap()[0], crate::crypto::FMT_SINGLE);
+    }
+
+    #[tokio::test]
+    async fn chunked_unencrypted_and_empty() {
+        let r = Repo::open_or_init(mem(), None, true).await.unwrap();
+        let data = noise(CHUNK_SIZE * 4 + 1);
+        let (id, _) = r.put_blob_from(std::io::Cursor::new(&data), data.len() as u64).await.unwrap();
+        assert!(r.get_blob(&id).await.unwrap() == data);
+        let (e, _) = r.put_blob_from(std::io::Cursor::new(Vec::new()), 0).await.unwrap();
+        assert!(r.get_blob(&e).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn no_key_needs_flag() {
         assert!(matches!(Repo::open_or_init(mem(), None, false).await, Err(CarryError::BadKey(_))));
@@ -537,6 +802,22 @@ mod minio_tests {
         ));
         assert_eq!(before, s.get(CONFIG_KEY).await.unwrap());
 
+        for k in s.list("").await.unwrap() {
+            s.delete(&k).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn minio_chunked_multipart_roundtrip() {
+        let Some(s) = live("chunked") else { return };
+        let r = Repo::open_or_init(s.clone(), None, true).await.unwrap();
+        let mut data = vec![0u8; (CHUNK_SIZE * 19) + 77];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut data);
+        let (id, up) = r.put_blob_from(std::io::Cursor::new(&data), data.len() as u64).await.unwrap();
+        assert!(up);
+        let mut out = Vec::new();
+        r.get_blob_to(&id, &mut out).await.unwrap();
+        assert!(out == data);
         for k in s.list("").await.unwrap() {
             s.delete(&k).await.unwrap();
         }
