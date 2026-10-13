@@ -251,7 +251,7 @@ if wait_http "http://127.0.0.1:${NODE_PORT}/healthz" 15 \
 else fail "$case_name" "${r:-} ${st:-}"; fi
 
 case_name="tool signed by another key is refused"
-other_pub="$(carry_json tool keygen | jq -r '.public_key')" || other_pub=""
+other_pub="$(carry_json tool keygen --out /work/other-signing.key | jq -r '.public_key')" || other_pub=""
 start_app e2e-node-bad "$NODE_IMG" "$((NODE_PORT + 1))" 3000 "${NODE_ENV[@]}" -e CARRY_TOOL_PUBKEY="$other_pub"
 if [[ -n "$other_pub" ]] && wait_http "http://127.0.0.1:$((NODE_PORT + 1))/healthz" 15 \
    && code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "http://127.0.0.1:$((NODE_PORT + 1))/jq")" \

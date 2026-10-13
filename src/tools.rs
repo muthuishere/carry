@@ -596,7 +596,23 @@ fn cache_dir(root: &Path) -> PathBuf {
 
 /// Entry point when carry runs under a tool's name. Returns an exit code only on failure.
 pub fn launch_from_argv0(name: &str) -> i32 {
-    match prepare(name) {
+    let root = std::env::var("CARRY_ROOT").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/carry"));
+    let outcome = prepare(name);
+    // Keep `carry status` truthful for on-demand launches, not just prefetch.
+    match &outcome {
+        Ok(_) => {
+            let ready = read_status(&root)
+                .get(name)
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str())
+                == Some("ready");
+            if !ready {
+                record_status(&root, &[(name.to_string(), Ok(()))]);
+            }
+        }
+        Err(e) => record_status(&root, &[(name.to_string(), Err(e.clone()))]),
+    }
+    match outcome {
         Ok(bin) => {
             use std::os::unix::process::CommandExt;
             let err = std::process::Command::new(&bin).arg0(name).args(std::env::args_os().skip(1)).exec();
