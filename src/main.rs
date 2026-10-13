@@ -1,5 +1,6 @@
 mod cli;
 mod crypto;
+mod ctx;
 mod error;
 mod model;
 mod ops;
