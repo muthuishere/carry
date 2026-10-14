@@ -1,0 +1,82 @@
+# Number of app replicas. All replicas share one carry state.
+replicaCount: 2
+
+# The application carry wraps. Its image needs no changes in initContainer mode.
+app:
+  image:
+    repository: nginx
+    tag: 1.27-alpine
+    pullPolicy: IfNotPresent
+  # Required: the app command. carry runs it as `carry run -- <command...>`,
+  # so the image ENTRYPOINT/CMD are replaced and must be spelled out here.
+  command: ["nginx", "-g", "daemon off;"]
+  # Extra env for the app (list of EnvVar).
+  env: []
+  ports:
+    - name: http
+      containerPort: 80
+  # Probe the APP, never carry: a degraded carry must not take pods out.
+  readinessProbe: {}
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 128Mi}
+  securityContext: {}
+  # Extra volumes / mounts for the app.
+  volumes: []
+  volumeMounts: []
+
+carry:
+  inject:
+    # initContainer: copy the carry binary into an emptyDir from installerImage.
+    # image: the app image already contains carry at `binary` (COPY --from=carry ...).
+    mode: initContainer
+    installerImage:
+      repository: ghcr.io/muthuishere/carry-installer
+      tag: 0.1.1
+      pullPolicy: IfNotPresent
+    # Path of the carry binary inside the app container.
+    # initContainer mode puts it at /opt/carry/carry; image mode usually /usr/local/bin/carry.
+    binary: ""
+
+  # s3://bucket/prefix (required)
+  repo: ""
+  # carry state name shared by every replica (required)
+  state: ""
+  # S3-compatible endpoint; empty for AWS S3.
+  endpoint: ""
+  region: us-east-1
+  pollSecs: 30
+  restoreBudgetMs: 2000
+  # Signal sent to the app after a new version is applied (e.g. HUP). Empty: none.
+  reloadSignal: ""
+  # Public key from `carry tool keygen`; public, so a plain value is fine.
+  toolPubkey: ""
+  # Where carry keeps generations and the tool cache (emptyDir).
+  root: /carry
+  rootSizeLimit: 512Mi
+
+  # Master key: a Secret holding 32 random bytes, base64 (`openssl rand -base64 32`).
+  # It is MOUNTED as a file (CARRY_KEY_FILE) and never set as an env var.
+  key:
+    existingSecret: ""
+    secretKey: key
+    # Only used when existingSecret is empty: the chart creates the Secret.
+    value: ""
+    mountPath: /var/run/carry-key
+
+  # S3 credentials. carry strips them from the app's environment.
+  s3Credentials:
+    existingSecret: ""
+    accessKeyIdKey: AWS_ACCESS_KEY_ID
+    secretAccessKeyKey: AWS_SECRET_ACCESS_KEY
+    # Only used when existingSecret is empty.
+    accessKeyId: ""
+    secretAccessKey: ""
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+terminationGracePeriodSeconds: 20
+imagePullSecrets: []

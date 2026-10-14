@@ -1,0 +1,31 @@
+apiVersion: v2
+name: carry
+description: Inject carry into any app container so config, env and tools are restored from an encrypted S3 repo before the app starts.
+type: application
+version: 0.1.1
+appVersion: "0.1.1"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/muthuishere/carry
+sources:
+  - https://github.com/muthuishere/carry
+keywords: [config, s3, encryption, sidecar-free, tools, restore]
+maintainers:
+  - name: muthuishere
+    url: https://github.com/muthuishere
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: integration-delivery
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/containsSecurityUpdates: "false"
+  artifacthub.io/operator: "false"
+  artifacthub.io/images: |
+    - name: carry
+      image: docker.io/muthuishere/carry:0.1.1
+  artifacthub.io/links: |
+    - name: source
+      url: https://github.com/muthuishere/carry
+    - name: CLI contract
+      url: https://github.com/muthuishere/carry/blob/main/docs/cli-contract.md
+  artifacthub.io/changes: |
+    - kind: added
+      description: First chart. Injects carry via an init container or uses an image that already contains it; key from a mounted Secret file.

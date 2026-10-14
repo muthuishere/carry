@@ -1,0 +1,13 @@
+carry wraps {{ .Values.app.image.repository }}:{{ .Values.app.image.tag }} in {{ .Values.replicaCount }} replica(s), state "{{ .Values.carry.state }}" from {{ .Values.carry.repo }}.
+
+Data in the bucket is ciphertext (XChaCha20-Poly1305, key never leaves the cluster).
+The key is mounted from Secret "{{ include "carry.keySecret" . }}" at {{ .Values.carry.key.mountPath }}
+and is never an env var; carry strips S3 credentials from the app's environment.
+
+Check carry in a pod (the app keeps running even when this says degraded):
+  kubectl exec deploy/{{ include "carry.fullname" . }} -c app -- {{ include "carry.binary" . }} status --json
+
+Change state from your machine (same repo + key):
+  carry put {{ .Values.carry.state }}:/etc/app.yaml ./app.yaml
+  carry env set {{ .Values.carry.state }} LOG_LEVEL=info
+Replicas pick it up within {{ .Values.carry.pollSecs }}s.

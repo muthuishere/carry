@@ -19,13 +19,20 @@ spec:
       containers:
         - name: web
           # Built from examples/nginx-config/Dockerfile:
-          #   COPY --from=$EMAIL_2/carry:0.1.0 /carry /usr/local/bin/carry
+          #   COPY --from=$EMAIL_2/carry:0.1.1 /carry /usr/local/bin/carry
           #   ENTRYPOINT ["carry","run","--"]
-          image: YOUR_REGISTRY/carry-example-nginx:0.1.0
+          image: YOUR_REGISTRY/carry-example-nginx:0.1.1
           args: ["nginx", "-g", "daemon off;"]
-          envFrom:
-            - secretRef: {name: carry-web}
           env:
+            - {name: CARRY_REPO, value: s3://YOUR_BUCKET/YOUR_PREFIX}
+            - {name: CARRY_S3_REGION, value: us-east-1}
+            # - {name: CARRY_S3_ENDPOINT, value: https://YOUR_S3_COMPATIBLE_ENDPOINT}   # omit for AWS S3
+            - {name: CARRY_TOOL_PUBKEY, value: YOUR_PUBLIC_KEY}   # from `carry tool keygen`
+            - {name: CARRY_KEY_FILE, value: /var/run/carry-key/key}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: carry-web-s3, key: AWS_ACCESS_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: carry-web-s3, key: AWS_SECRET_ACCESS_KEY}}
             - {name: CARRY_STATE, value: web-1}
             - {name: CARRY_ROOT, value: /carry}
             - {name: CARRY_POLL_SECS, value: "30"}
@@ -43,7 +50,10 @@ spec:
             limits: {memory: 128Mi}
           volumeMounts:
             - {name: carry, mountPath: /carry}
+            - {name: carry-key, mountPath: /var/run/carry-key, readOnly: true}
       volumes:
         - name: carry
           emptyDir:
             sizeLimit: 512Mi   # generations + tool cache
+        - name: carry-key
+          secret: {secretName: carry-web-key, defaultMode: 0400}

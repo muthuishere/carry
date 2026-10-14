@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["app", "carry"],
+  "properties": {
+    "replicaCount": {"type": "integer", "minimum": 0},
+    "app": {
+      "type": "object",
+      "required": ["image", "command"],
+      "properties": {
+        "image": {
+          "type": "object",
+          "required": ["repository", "tag"],
+          "properties": {
+            "repository": {"type": "string", "minLength": 1},
+            "tag": {"type": "string", "minLength": 1},
+            "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+          }
+        },
+        "command": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "env": {"type": "array"},
+        "ports": {"type": "array"},
+        "readinessProbe": {"type": "object"},
+        "resources": {"type": "object"},
+        "securityContext": {"type": "object"},
+        "volumes": {"type": "array"},
+        "volumeMounts": {"type": "array"}
+      }
+    },
+    "carry": {
+      "type": "object",
+      "required": ["repo", "state", "inject", "key", "s3Credentials"],
+      "properties": {
+        "inject": {
+          "type": "object",
+          "required": ["mode"],
+          "properties": {
+            "mode": {"enum": ["initContainer", "image"]},
+            "installerImage": {
+              "type": "object",
+              "properties": {
+                "repository": {"type": "string"},
+                "tag": {"type": "string"},
+                "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+              }
+            },
+            "binary": {"type": "string"}
+          }
+        },
+        "repo": {"type": "string", "pattern": "^(s3://[^/]+(/.*)?)?$"},
+        "state": {"type": "string", "pattern": "^([A-Za-z0-9][A-Za-z0-9._-]*)?$"},
+        "endpoint": {"type": "string"},
+        "region": {"type": "string"},
+        "pollSecs": {"type": "integer", "minimum": 1},
+        "restoreBudgetMs": {"type": "integer", "minimum": 0},
+        "reloadSignal": {"type": "string"},
+        "toolPubkey": {"type": "string"},
+        "root": {"type": "string", "pattern": "^/"},
+        "rootSizeLimit": {"type": "string"},
+        "key": {
+          "type": "object",
+          "properties": {
+            "existingSecret": {"type": "string"},
+            "secretKey": {"type": "string", "minLength": 1},
+            "value": {"type": "string"},
+            "mountPath": {"type": "string", "pattern": "^/"}
+          }
+        },
+        "s3Credentials": {
+          "type": "object",
+          "properties": {
+            "existingSecret": {"type": "string"},
+            "accessKeyIdKey": {"type": "string"},
+            "secretAccessKeyKey": {"type": "string"},
+            "accessKeyId": {"type": "string"},
+            "secretAccessKey": {"type": "string"}
+          }
+        }
+      }
+    },
+    "podAnnotations": {"type": "object"},
+    "podLabels": {"type": "object"},
+    "nodeSelector": {"type": "object"},
+    "tolerations": {"type": "array"},
+    "affinity": {"type": "object"},
+    "terminationGracePeriodSeconds": {"type": "integer"},
+    "imagePullSecrets": {"type": "array"}
+  }
+}

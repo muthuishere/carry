@@ -52,6 +52,28 @@ jobs:
             org.opencontainers.image.licenses=Apache-2.0
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Init-container helper for the Helm chart: busybox + /carry (the main image is
+      # FROM scratch, so it cannot copy itself into a pod's emptyDir).
+      - id: itags
+        run: |
+          {
+            echo "list<<EOF"
+            echo "ghcr.io/muthuishere/carry-installer:${{ steps.ver.outputs.version }}"
+            if [ "$HAS_DOCKERHUB" = "true" ]; then
+              echo "docker.io/muthuishere/carry-installer:${{ steps.ver.outputs.version }}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: deploy/helm/carry/installer
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: CARRY_IMAGE=ghcr.io/muthuishere/carry:${{ steps.ver.outputs.version }}
+          tags: ${{ steps.itags.outputs.list }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/muthuishere/carry
+            org.opencontainers.image.licenses=Apache-2.0
 
   binaries:
     runs-on: ubuntu-latest

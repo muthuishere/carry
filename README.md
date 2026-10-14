@@ -87,7 +87,8 @@ print(c.get("web-1:/etc/app.yaml"))
 - Design decisions: [`docs/adr`](docs/adr)
 - Spec: [`openspec/changes/carry-v0-1`](openspec/changes/carry-v0-1)
 - End-to-end example with MinIO: [`examples/`](examples), run `examples/e2e.sh`
-- Kubernetes: [`deploy/k8s`](deploy/k8s)
+- Kubernetes: Helm chart [`deploy/helm/carry`](deploy/helm/carry) (init-container injection, key from a mounted Secret), plain manifests in [`deploy/k8s`](deploy/k8s)
+- Encryption proof (Docker + kind): `examples/encryption-e2e.sh` scans every object in the bucket for known plaintext, then restores it in both
 
 ## License
 
