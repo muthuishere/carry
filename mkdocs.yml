@@ -1,0 +1,58 @@
+site_name: carry
+site_description: Your container's tools and config, from any S3 bucket.
+site_url: https://muthuishere.github.io/carry/
+repo_url: https://github.com/muthuishere/carry
+repo_name: muthuishere/carry
+edit_uri: edit/main/docs-site/
+docs_dir: docs-site
+site_dir: site
+strict: true
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle: {icon: material/brightness-7, name: Dark mode}
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle: {icon: material/brightness-4, name: Light mode}
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc: {permalink: true}
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed: {alternate_style: true}
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - How it works: how-it-works.md
+  - Guides:
+      - Docker: guides/docker.md
+      - Kubernetes: guides/kubernetes.md
+      - Tools: guides/tools.md
+      - Profiles: guides/profiles.md
+  - CLI reference: cli.md
+  - SDKs:
+      - Overview: sdk/index.md
+      - JavaScript: sdk/javascript.md
+      - Python: sdk/python.md
+      - C# / .NET: sdk/dotnet.md
+      - Java: sdk/java.md
+      - Go: sdk/go.md
+  - Security model: security.md
+  - Operations: operations.md
+  - FAQ: faq.md
+  - Troubleshooting: troubleshooting.md
