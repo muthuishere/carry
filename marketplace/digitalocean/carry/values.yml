@@ -1,0 +1,4 @@
+# DigitalOcean defaults: point at a Spaces bucket. Users edit after install.
+repo: ""               # e.g. s3://my-space/carry
+s3:
+  endpoint: https://nyc3.digitaloceanspaces.com

@@ -1,0 +1,8 @@
+# Place at the ROOT of the Helm repository served to Artifact Hub
+# (e.g. the gh-pages branch of github.com/muthuishere/carry, or as an OCI artifact
+#  oci://ghcr.io/muthuishere/charts/carry:artifacthub.io via `oras push ... artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml`).
+# repositoryID is shown in Artifact Hub after "Add repository"; fill it in to get the Verified Publisher badge.
+repositoryID: REPLACE_WITH_ID_FROM_ARTIFACTHUB
+owners:
+  - name: muthuishere
+    email: REPLACE_WITH_PUBLIC_CONTACT_EMAIL

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/0.1.2-preview/CreateUIDefinition.MultiVm.json#",
+  "handler": "Microsoft.Azure.CreateUIDef",
+  "version": "0.1.2-preview",
+  "parameters": {
+    "basics": [],
+    "steps": [
+      { "name": "carry", "label": "carry settings", "elements": [
+        { "name": "repo", "type": "Microsoft.Common.TextBox", "label": "S3 repo URL", "constraints": { "required": true, "regex": "^s3://.+", "validationMessage": "Must start with s3://" } },
+        { "name": "endpoint", "type": "Microsoft.Common.TextBox", "label": "S3 endpoint", "constraints": { "required": true } }
+      ]}
+    ],
+    "outputs": { "repo": "[steps('carry').repo]", "endpoint": "[steps('carry').endpoint]" }
+  }
+}

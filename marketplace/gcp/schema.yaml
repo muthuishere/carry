@@ -1,0 +1,33 @@
+# GCP Marketplace Kubernetes app - deployer schema (v2). Build deployer image from
+# gcr.io/cloud-marketplace-tools/k8s/deployer_helm/onbuild with the chart under /data/chart.
+x-google-marketplace:
+  schemaVersion: v2
+  applicationApiVersion: v1beta1
+  publishedVersion: "0.1.1"
+  publishedVersionMetadata:
+    releaseNote: "Initial release."
+    recommended: true
+  images:
+    "":
+      properties:
+        image.repository: { type: REPO_WITH_REGISTRY }
+        image.tag: { type: TAG }
+  clusterConstraints:
+    resources:
+      - replicas: 1
+        requests: { cpu: 50m, memory: 32Mi }
+properties:
+  name:
+    type: string
+    x-google-marketplace: { type: NAME }
+  namespace:
+    type: string
+    x-google-marketplace: { type: NAMESPACE }
+  repo:
+    type: string
+    title: S3 repo URL (s3://bucket/prefix)
+  s3.endpoint:
+    type: string
+    title: S3-compatible endpoint
+    default: https://storage.googleapis.com
+required: [name, namespace, repo]

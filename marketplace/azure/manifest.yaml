@@ -1,0 +1,14 @@
+# Azure Kubernetes application offer (Partner Center) - CPA packaging tool manifest.
+# Build: docker run --rm -v $PWD:/data -v /var/run/docker.sock:/var/run/docker.sock mcr.microsoft.com/container-package-app:latest
+#        cpa verify && cpa buildbundle   (pushes CNAB bundle to your ACR)
+applicationName: carry
+publisher: "Deemwar"
+description: "Encrypted config, env and tools for containers from S3"
+version: 0.1.1
+helmChart: "./carry"            # copy of deploy/helm/carry
+clusterARMTemplate: "./mainTemplate.json"
+uiDefinition: "./createUIDefinition.json"
+registryServer: "REPLACE.azurecr.io"
+extensionRegistrationParameters:
+  defaultScope: "cluster"
+  namespace: "carry"

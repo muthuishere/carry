@@ -1,0 +1,16 @@
+# Merge into deploy/helm/carry/Chart.yaml (owned by the chart agent - not edited here).
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: storage
+  artifacthub.io/operator: "false"
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/links: |
+    - name: source
+      url: https://github.com/muthuishere/carry
+    - name: support
+      url: https://github.com/muthuishere/carry/issues
+  artifacthub.io/images: |
+    - name: carry
+      image: ghcr.io/muthuishere/carry:0.1.1
+      platforms: [linux/amd64, linux/arm64]
+  artifacthub.io/signKey: ""   # fill if chart is signed (helm package --sign / cosign)
