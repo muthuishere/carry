@@ -1,13 +1,20 @@
 plugins {
     id 'java-library'
+    id 'maven-publish'
+    id 'signing'
 }
 
 group = 'io.github.muthuishere'
-version = '0.1.0'
+version = '0.1.1'
 
 tasks.withType(JavaCompile).configureEach { options.release = 17 }
 
 repositories { mavenCentral() }
+
+java {
+    withSourcesJar()
+    withJavadocJar()
+}
 
 dependencies {
     testImplementation platform('org.junit:junit-bom:5.11.4')
@@ -31,4 +38,52 @@ test {
 tasks.register('runExample', JavaExec) {
     classpath = sourceSets.examples.runtimeClasspath
     mainClass = 'BasicExample'
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            artifactId = 'carry-sdk'
+            from components.java
+            pom {
+                name = 'carry-sdk'
+                description = "Java SDK for carry: your container's tools and config, from any S3 bucket (thin wrapper over the carry CLI JSON interface)"
+                url = 'https://github.com/muthuishere/carry'
+                licenses {
+                    license {
+                        name = 'Apache-2.0'
+                        url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+                developers {
+                    developer {
+                        id = 'muthuishere'
+                        name = 'Muthukumaran Navaneethakrishnan'
+                        url = 'https://github.com/muthuishere'
+                    }
+                }
+                scm {
+                    url = 'https://github.com/muthuishere/carry'
+                    connection = 'scm:git:https://github.com/muthuishere/carry.git'
+                    developerConnection = 'scm:git:ssh://git@github.com/muthuishere/carry.git'
+                }
+            }
+        }
+    }
+    repositories {
+        // Bundle layout for the Central Portal upload API (see .github/workflows/publish-sdks.yml)
+        maven { name = 'staging'; url = layout.buildDirectory.dir('staging-deploy') }
+    }
+}
+
+signing {
+    // CI: in-memory ASCII-armored key from env. Local: the gpg agent (-PuseGpgCmd).
+    def key = System.getenv('SIGNING_KEY')
+    if (key) {
+        useInMemoryPgpKeys(key, System.getenv('SIGNING_PASSWORD') ?: '')
+    } else if (project.hasProperty('useGpgCmd')) {
+        useGpgCmd()
+    }
+    required { gradle.taskGraph.hasTask('publishMavenPublicationToStagingRepository') }
+    sign publishing.publications.maven
 }

@@ -8,7 +8,7 @@ import subprocess
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 __all__ = ["Carry", "CarryError", "UsageError", "UnreachableError", "RefusedError", "ConflictError"]
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 class CarryError(Exception):

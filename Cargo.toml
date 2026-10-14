@@ -5,6 +5,11 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Your container's tools and config, from any S3 bucket"
 repository = "https://github.com/muthuishere/carry"
+homepage = "https://github.com/muthuishere/carry"
+readme = "README.md"
+keywords = ["s3", "containers", "kubernetes", "config", "sidecar"]
+categories = ["command-line-utilities", "filesystem"]
+include = ["src/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [dependencies]
 anyhow = "1"

@@ -5,8 +5,18 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <PackageId>Carry.Sdk</PackageId>
-    <Version>0.1.0</Version>
-    <Description>Thin .NET wrapper over the carry CLI JSON interface</Description>
+    <Version>0.1.1</Version>
+    <Authors>Muthukumaran Navaneethakrishnan</Authors>
+    <Description>.NET SDK for carry: your container's tools and config, from any S3 bucket (thin wrapper over the carry CLI JSON interface)</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/muthuishere/carry</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/muthuishere/carry.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>carry;s3;containers;config;kubernetes;sdk</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
 </Project>

@@ -1,13 +1,19 @@
 {
   "name": "@muthuishere/carry",
-  "version": "0.1.0",
-  "description": "Thin Node.js wrapper over the carry CLI JSON interface",
+  "version": "0.1.1",
+  "description": "Node.js SDK for carry: your container's tools and config, from any S3 bucket (thin wrapper over the carry CLI JSON interface)",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",
   "exports": { ".": { "types": "./index.d.ts", "default": "./index.js" } },
-  "files": ["index.js", "index.d.ts"],
+  "files": ["index.js", "index.d.ts", "README.md"],
   "engines": { "node": ">=18" },
   "scripts": { "test": "node --test test/*.test.js" },
-  "license": "MIT"
+  "keywords": ["carry", "s3", "containers", "config", "kubernetes", "sdk", "cli"],
+  "homepage": "https://github.com/muthuishere/carry#readme",
+  "bugs": { "url": "https://github.com/muthuishere/carry/issues" },
+  "repository": { "type": "git", "url": "git+https://github.com/muthuishere/carry.git", "directory": "sdk/js" },
+  "author": "Muthukumaran Navaneethakrishnan",
+  "license": "Apache-2.0",
+  "publishConfig": { "access": "public" }
 }
